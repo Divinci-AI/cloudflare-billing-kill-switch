@@ -453,6 +453,15 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Auth: require ADMIN_SECRET for all non-health endpoints
+    const adminSecret = (env as any).ADMIN_SECRET;
+    if (adminSecret && url.pathname !== "/") {
+      const authHeader = request.headers.get("Authorization");
+      if (authHeader !== `Bearer ${adminSecret}`) {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+    }
+
     // Manual check trigger
     if (url.pathname === "/check") {
       const result = await checkUsage(env);
