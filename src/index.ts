@@ -22,6 +22,18 @@ interface Env {
   CLOUDFLARE_API_TOKEN: string;
   CLOUDFLARE_ACCOUNT_ID: string;
 
+  // Kill Switch service (https://kill-switch.net)
+  KILL_SWITCH_API_URL?: string;       // Default: https://api.kill-switch.net
+  KILL_SWITCH_AGENT_API_KEY?: string; // Agent API key from kill-switch.net dashboard
+
+  // GCP Cloud Run monitoring
+  GCP_SERVICE_ACCOUNT_JSON?: string;  // GCP service account JSON for monitoring API
+  GCP_PROJECT_ID?: string;            // GCP project ID (e.g., "openai-api-4375643")
+  GCP_REGION?: string;                // GCP region (default: "us-central1")
+  CLOUD_RUN_REQUEST_THRESHOLD: string;     // Daily Cloud Run requests before alerting
+  CLOUD_RUN_INSTANCE_THRESHOLD: string;    // Max concurrent instances before alerting
+  CLOUD_RUN_MONTHLY_COST_THRESHOLD: string; // Estimated monthly cost USD before alerting
+
   // Alert destinations (at least one recommended)
   PAGERDUTY_ROUTING_KEY?: string;  // Events API v2 integration key
   DISCORD_WEBHOOK_URL?: string;    // Discord channel webhook URL
@@ -32,6 +44,10 @@ interface Env {
   DO_REQUEST_THRESHOLD: string;           // Daily DO requests before alerting
   DO_WALLTIME_HOURS_THRESHOLD: string;    // Daily DO wall-time hours before alerting
   WORKER_REQUEST_THRESHOLD: string;       // Daily Worker requests before alerting
+  R2_OPS_THRESHOLD: string;              // Daily R2 operations (class A + B) before alerting
+  D1_ROWS_WRITTEN_THRESHOLD: string;     // Daily D1 rows written before alerting
+  D1_ROWS_READ_THRESHOLD: string;        // Daily D1 rows read before alerting
+  QUEUE_MESSAGES_THRESHOLD: string;      // Daily Queue messages before alerting
 
   // Kill switch behavior
   AUTO_DISCONNECT: string;   // "true" to auto-disconnect routes (reversible)
@@ -54,11 +70,41 @@ interface WorkerUsage {
   cpuTimeMs: number;
 }
 
+interface R2Usage {
+  bucketName: string;
+  classAOps: number;   // Mutating: PUT, POST, DELETE, LIST — $4.50/million
+  classBOps: number;   // Read: GET, HEAD — $0.36/million
+  storageGB: number;
+}
+
+interface D1Usage {
+  databaseId: string;
+  rowsRead: number;    // $0.001/million after 25B free
+  rowsWritten: number; // $1.00/million after 50M free
+}
+
+interface QueueUsage {
+  queueId: string;
+  messagesProduced: number;
+  messagesConsumed: number;  // $0.40/million
+}
+
+interface CloudRunServiceUsage {
+  serviceName: string;
+  requests: number;
+  activeInstances: number;
+  estimatedDailyCostUSD: number;
+}
+
 interface CheckResult {
   violations: string[];
   actions: string[];
   doUsage: DOUsage[];
   workerUsage: WorkerUsage[];
+  r2Usage: R2Usage[];
+  d1Usage: D1Usage[];
+  queueUsage: QueueUsage[];
+  cloudRunUsage: CloudRunServiceUsage[];
 }
 
 // ─── Cloudflare GraphQL Analytics ───────────────────────────────────────────
@@ -116,6 +162,148 @@ async function queryWorkerUsage(env: Env): Promise<WorkerUsage[]> {
   }));
 }
 
+// cfGraphQLSafe — like cfGraphQL but returns null instead of throwing on errors.
+// Used for R2/D1/Queue metrics where the GraphQL dataset names may vary.
+async function cfGraphQLSafe(env: Env, query: string): Promise<any | null> {
+  try {
+    return await cfGraphQL(env, query);
+  } catch (e) {
+    console.error(`[kill-switch] GraphQL query failed (non-fatal): ${e}`);
+    return null;
+  }
+}
+
+async function queryR2Usage(env: Env): Promise<R2Usage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        r2OperationsAdaptiveGroups(
+          limit: 50,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_requests_DESC]
+        ) {
+          dimensions { bucketName actionType }
+          sum { requests }
+        }
+        r2StorageAdaptiveGroups(
+          limit: 50,
+          filter: {date_geq: "${today}"}
+        ) {
+          dimensions { bucketName }
+          max { payloadSize }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  const account = data?.data?.viewer?.accounts?.[0];
+  const opsGroups = account?.r2OperationsAdaptiveGroups ?? [];
+  const storageGroups = account?.r2StorageAdaptiveGroups ?? [];
+
+  const buckets = new Map<string, R2Usage>();
+  for (const g of opsGroups) {
+    const name = g.dimensions.bucketName;
+    if (!buckets.has(name)) {
+      buckets.set(name, { bucketName: name, classAOps: 0, classBOps: 0, storageGB: 0 });
+    }
+    const bucket = buckets.get(name)!;
+    const actionType = (g.dimensions.actionType || "").toLowerCase();
+    if (actionType.includes("get") || actionType.includes("head")) {
+      bucket.classBOps += g.sum.requests;
+    } else {
+      bucket.classAOps += g.sum.requests;
+    }
+  }
+  for (const g of storageGroups) {
+    const name = g.dimensions.bucketName;
+    if (!buckets.has(name)) {
+      buckets.set(name, { bucketName: name, classAOps: 0, classBOps: 0, storageGB: 0 });
+    }
+    buckets.get(name)!.storageGB = (g.max?.payloadSize || 0) / (1024 * 1024 * 1024);
+  }
+
+  return [...buckets.values()];
+}
+
+async function queryD1Usage(env: Env): Promise<D1Usage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        d1AnalyticsAdaptiveGroups(
+          limit: 50,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_rowsRead_DESC]
+        ) {
+          dimensions { databaseId }
+          sum { rowsRead rowsWritten }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  const groups = data?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups ?? [];
+  return groups.map((g: any) => ({
+    databaseId: g.dimensions.databaseId,
+    rowsRead: g.sum.rowsRead,
+    rowsWritten: g.sum.rowsWritten,
+  }));
+}
+
+async function queryQueueUsage(env: Env): Promise<QueueUsage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        queueConsumerMetricsAdaptiveGroups(
+          limit: 50,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_messages_DESC]
+        ) {
+          dimensions { queueId }
+          sum { messages }
+        }
+        queueProducerMetricsAdaptiveGroups(
+          limit: 50,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_messages_DESC]
+        ) {
+          dimensions { queueId }
+          sum { messages }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  const account = data?.data?.viewer?.accounts?.[0];
+  const consumerGroups = account?.queueConsumerMetricsAdaptiveGroups ?? [];
+  const producerGroups = account?.queueProducerMetricsAdaptiveGroups ?? [];
+
+  const queues = new Map<string, QueueUsage>();
+  for (const g of producerGroups) {
+    const id = g.dimensions.queueId;
+    if (!queues.has(id)) queues.set(id, { queueId: id, messagesProduced: 0, messagesConsumed: 0 });
+    queues.get(id)!.messagesProduced += g.sum.messages;
+  }
+  for (const g of consumerGroups) {
+    const id = g.dimensions.queueId;
+    if (!queues.has(id)) queues.set(id, { queueId: id, messagesProduced: 0, messagesConsumed: 0 });
+    queues.get(id)!.messagesConsumed += g.sum.messages;
+  }
+
+  return [...queues.values()];
+}
+
 async function cfGraphQL(env: Env, query: string): Promise<any> {
   const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
     method: "POST",
@@ -138,6 +326,290 @@ async function cfGraphQL(env: Env, query: string): Promise<any> {
     throw new Error(`CF GraphQL error: ${JSON.stringify(data.errors)}`);
   }
   return data;
+}
+
+// ─── GCP Cloud Run Monitoring ────────────────────────────────────────────────
+
+function toBase64Url(str: string): string {
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function getGCPAccessToken(serviceAccountJson: string): Promise<string> {
+  const sa = JSON.parse(serviceAccountJson);
+
+  // Build JWT for token exchange (all parts must be base64url-encoded per RFC 7519)
+  const now = Math.floor(Date.now() / 1000);
+  const header = toBase64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const payload = toBase64Url(JSON.stringify({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/monitoring.read https://www.googleapis.com/auth/cloud-platform",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  }));
+
+  // Import the private key and sign
+  const keyData = sa.private_key
+    .replace(/-----BEGIN PRIVATE KEY-----/, "")
+    .replace(/-----END PRIVATE KEY-----/, "")
+    .replace(/\s/g, "");
+  const keyBuffer = Uint8Array.from(atob(keyData), (c) => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    keyBuffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signatureInput = new TextEncoder().encode(`${header}.${payload}`);
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, signatureInput);
+  const sig = toBase64Url(String.fromCharCode(...new Uint8Array(signature)));
+
+  const jwt = `${header}.${payload}.${sig}`;
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+
+  const tokenText = await tokenRes.text();
+  let tokenData: any;
+  try {
+    tokenData = JSON.parse(tokenText);
+  } catch {
+    throw new Error(`GCP token parse error: ${tokenText.substring(0, 200)}`);
+  }
+
+  if (!tokenData.access_token) {
+    throw new Error(`GCP token error: ${tokenText.substring(0, 200)}`);
+  }
+
+  return tokenData.access_token;
+}
+
+async function queryCloudRunUsage(env: Env): Promise<CloudRunServiceUsage[]> {
+  if (!env.GCP_SERVICE_ACCOUNT_JSON || !env.GCP_PROJECT_ID) {
+    console.error("[kill-switch] GCP credentials not configured, skipping Cloud Run monitoring");
+    return [];
+  }
+
+  const accessToken = await getGCPAccessToken(env.GCP_SERVICE_ACCOUNT_JSON);
+  const projectId = env.GCP_PROJECT_ID;
+  const region = env.GCP_REGION || "us-central1";
+  const results: CloudRunServiceUsage[] = [];
+
+  // Dynamically list ALL Cloud Run services (handles inconsistent naming
+  // across environments — some production services lack the "production-" prefix)
+  const serviceNames = await listCloudRunServices(accessToken, projectId, region);
+  console.error(`[kill-switch] Found ${serviceNames.length} Cloud Run services`);
+
+  for (const serviceName of serviceNames) {
+    try {
+      // Query Cloud Monitoring for request count and instance count
+      const now = new Date();
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+      const endTime = now.toISOString();
+
+      // Request count metric (cumulative today — ALIGN_SUM is correct)
+      const requestCount = await queryCloudMonitoringMetric(
+        accessToken, projectId,
+        `metric.type="run.googleapis.com/request_count" AND resource.labels.service_name="${serviceName}"`,
+        startOfDay, endTime,
+        "ALIGN_SUM"
+      );
+
+      // Peak concurrent instances today (ALIGN_MAX — not SUM, which would
+      // sum every sampled data point into a meaningless cumulative number)
+      const peakInstances = await queryCloudMonitoringMetric(
+        accessToken, projectId,
+        `metric.type="run.googleapis.com/container/instance_count" AND resource.labels.service_name="${serviceName}"`,
+        startOfDay, endTime,
+        "ALIGN_MAX"
+      );
+
+      // Estimate daily cost based on Cloud Run pricing (2nd gen, us-central1):
+      // CPU: $0.00002400/vCPU-second, Memory: $0.00000250/GiB-second
+      // Request: $0.40/million
+      // Assumes 2 vCPU, 2 GiB per instance (matches deploy/config.json defaults)
+      const hoursElapsedToday = (now.getTime() - new Date(startOfDay).getTime()) / 3600000;
+      const cpuCostPerInstanceHour = 2 * 0.0000240 * 3600;    // 2 vCPU × rate × 3600s
+      const memCostPerInstanceHour = 2 * 0.0000025 * 3600;    // 2 GiB × rate × 3600s
+      const instanceCostSoFar = peakInstances * (cpuCostPerInstanceHour + memCostPerInstanceHour) * hoursElapsedToday;
+      const requestCost = requestCount * 0.0000004;
+
+      // Only extrapolate to full day if we have at least 2 hours of data.
+      // Before that, extrapolation amplifies noise wildly (e.g., at 00:01,
+      // multiplier is 1,440x — a single request would estimate $960/day).
+      let estimatedDailyCost: number;
+      if (hoursElapsedToday >= 2) {
+        estimatedDailyCost = (instanceCostSoFar + requestCost) * (24 / hoursElapsedToday);
+      } else {
+        // Use raw accumulated cost — no extrapolation
+        estimatedDailyCost = instanceCostSoFar + requestCost;
+      }
+
+      results.push({
+        serviceName,
+        requests: requestCount,
+        activeInstances: peakInstances,
+        estimatedDailyCostUSD: Math.round(estimatedDailyCost * 100) / 100,
+      });
+    } catch (e) {
+      console.error(`[kill-switch] Error checking Cloud Run service ${serviceName}: ${e}`);
+    }
+  }
+
+  return results;
+}
+
+async function listCloudRunServices(
+  accessToken: string,
+  projectId: string,
+  region: string
+): Promise<string[]> {
+  const res = await fetch(
+    `https://run.googleapis.com/v2/projects/${projectId}/locations/${region}/services?pageSize=100`,
+    { headers: { "Authorization": `Bearer ${accessToken}` } }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error(`[kill-switch] Failed to list Cloud Run services: ${res.status} ${text.substring(0, 200)}`);
+    return [];
+  }
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error(`[kill-switch] Failed to parse Cloud Run services list: ${text.substring(0, 200)}`);
+    return [];
+  }
+
+  // Filter to divinci-* services only (skip unrelated services in the project)
+  return (data.services || [])
+    .map((s: any) => {
+      // name format: "projects/PROJECT/locations/REGION/services/SERVICE_NAME"
+      const parts = (s.name as string).split("/");
+      return parts[parts.length - 1];
+    })
+    .filter((name: string) => name.startsWith("divinci-"));
+}
+
+async function queryCloudMonitoringMetric(
+  accessToken: string,
+  projectId: string,
+  filter: string,
+  startTime: string,
+  endTime: string,
+  aligner: "ALIGN_SUM" | "ALIGN_MAX" | "ALIGN_MEAN" = "ALIGN_SUM"
+): Promise<number> {
+  const params = new URLSearchParams({
+    filter,
+    "interval.startTime": startTime,
+    "interval.endTime": endTime,
+    "aggregation.alignmentPeriod": "86400s",
+    "aggregation.perSeriesAligner": aligner,
+  });
+
+  const res = await fetch(
+    `https://monitoring.googleapis.com/v3/projects/${projectId}/timeSeries?${params}`,
+    { headers: { "Authorization": `Bearer ${accessToken}` } }
+  );
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error(`[kill-switch] Cloud Monitoring error: ${res.status} ${text.substring(0, 200)}`);
+    return 0;
+  }
+
+  const text = await res.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return 0;
+  }
+
+  // Sum up all time series points
+  let total = 0;
+  for (const ts of data.timeSeries || []) {
+    for (const point of ts.points || []) {
+      total += Number(point.value?.int64Value || point.value?.doubleValue || 0);
+    }
+  }
+  return total;
+}
+
+// ─── Kill Switch Service Reporting ──────────────────────────────────────────
+
+async function reportToKillSwitch(
+  env: Env,
+  result: CheckResult
+): Promise<void> {
+  if (!env.KILL_SWITCH_AGENT_API_KEY) {
+    console.error("[kill-switch] KILL_SWITCH_AGENT_API_KEY not set, skipping kill-switch.net reporting");
+    return;
+  }
+
+  const apiUrl = env.KILL_SWITCH_API_URL || "https://api.kill-switch.net";
+
+  // Combine CF workers + GCP Cloud Run into unified service list
+  const services = [
+    ...result.workerUsage.map((w) => ({
+      name: `cf:${w.scriptName}`,
+      doRequests: 0,
+      workerRequests: w.requests,
+      estimatedDailyCostUSD: w.requests * 0.0000003, // $0.30/million after free tier
+    })),
+    ...result.doUsage.map((d) => ({
+      name: `cf:${d.scriptName}`,
+      doRequests: d.requests,
+      workerRequests: 0,
+      estimatedDailyCostUSD: (d.requests * 0.00000015) + (d.wallTimeHours * 12.50 / 1000), // rough DO pricing
+    })),
+    ...result.cloudRunUsage.map((cr) => ({
+      name: `gcp:${cr.serviceName}`,
+      doRequests: 0,
+      workerRequests: cr.requests,
+      estimatedDailyCostUSD: cr.estimatedDailyCostUSD,
+    })),
+  ];
+
+  const totalCost = services.reduce((sum, s) => sum + s.estimatedDailyCostUSD, 0);
+
+  const payload = {
+    accountId: env.CLOUDFLARE_ACCOUNT_ID,
+    checkedAt: Date.now(),
+    services,
+    totalEstimatedDailyCostUSD: Math.round(totalCost * 100) / 100,
+    violations: result.violations.map((v) => ({ message: v, severity: "critical" })),
+    actionsTaken: result.actions.map((a) => ({ action: a, timestamp: new Date().toISOString() })),
+  };
+
+  try {
+    const res = await fetch(`${apiUrl}/agent/report`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.KILL_SWITCH_AGENT_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`[kill-switch] kill-switch.net report error: ${res.status} ${text.substring(0, 200)}`);
+    } else {
+      console.error("[kill-switch] Successfully reported to kill-switch.net");
+    }
+  } catch (e) {
+    console.error(`[kill-switch] Failed to report to kill-switch.net: ${e}`);
+  }
 }
 
 // ─── Worker Kill Switch ─────────────────────────────────────────────────────
@@ -362,6 +834,9 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   const doReqThreshold = parseInt(env.DO_REQUEST_THRESHOLD || "1000000");
   const doWallThreshold = parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100");
   const workerReqThreshold = parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000");
+  const crReqThreshold = parseInt(env.CLOUD_RUN_REQUEST_THRESHOLD || "5000000");
+  const crInstanceThreshold = parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "50");
+  const crMonthlyCostThreshold = parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "500");
   const autoDisconnect = env.AUTO_DISCONNECT === "true";
   const autoDelete = env.AUTO_DELETE === "true";
   const protectedWorkers = (env.PROTECTED_WORKERS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -369,70 +844,165 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   const violations: string[] = [];
   const actions: string[] = [];
 
-  // Check DO usage
-  console.error("[kill-switch] Checking Durable Object usage...");
-  const doUsage = await queryDOUsage(env);
+  const r2OpsThreshold = parseInt(env.R2_OPS_THRESHOLD || "50000000");
+  const d1RowsWrittenThreshold = parseInt(env.D1_ROWS_WRITTEN_THRESHOLD || "10000000");
+  const d1RowsReadThreshold = parseInt(env.D1_ROWS_READ_THRESHOLD || "500000000");
+  const queueMsgThreshold = parseInt(env.QUEUE_MESSAGES_THRESHOLD || "50000000");
 
-  for (const usage of doUsage) {
-    const reqExceeded = usage.requests > doReqThreshold;
-    const wallExceeded = usage.wallTimeHours > doWallThreshold;
+  // Check Cloudflare usage (wrapped in try/catch so CF failures
+  // don't prevent GCP checks or kill-switch.net reporting)
+  let doUsage: DOUsage[] = [];
+  let workerUsage: WorkerUsage[] = [];
+  let r2Usage: R2Usage[] = [];
+  let d1Usage: D1Usage[] = [];
+  let queueUsage: QueueUsage[] = [];
+  try {
+    // Check DO usage
+    console.error("[kill-switch] Checking Durable Object usage...");
+    doUsage = await queryDOUsage(env);
 
-    if (reqExceeded || wallExceeded) {
-      const msg = `DO THRESHOLD EXCEEDED: ${usage.scriptName} - ${usage.requests.toLocaleString()} reqs, ${usage.wallTimeHours.toFixed(0)}h wall-time`;
-      violations.push(msg);
-      console.error(`[kill-switch] ${msg}`);
+    for (const usage of doUsage) {
+      const reqExceeded = usage.requests > doReqThreshold;
+      const wallExceeded = usage.wallTimeHours > doWallThreshold;
 
-      if (protectedWorkers.includes(usage.scriptName)) {
-        actions.push(`PROTECTED: ${usage.scriptName} exceeded threshold but is protected`);
-        continue;
+      if (reqExceeded || wallExceeded) {
+        const msg = `DO THRESHOLD EXCEEDED: ${usage.scriptName} - ${usage.requests.toLocaleString()} reqs, ${usage.wallTimeHours.toFixed(0)}h wall-time`;
+        violations.push(msg);
+        console.error(`[kill-switch] ${msg}`);
+
+        if (protectedWorkers.includes(usage.scriptName)) {
+          actions.push(`PROTECTED: ${usage.scriptName} exceeded threshold but is protected`);
+          continue;
+        }
+
+        if (autoDelete) {
+          const result = await deleteWorker(env, usage.scriptName);
+          actions.push(result);
+        } else if (autoDisconnect) {
+          const results = await disconnectWorker(env, usage.scriptName);
+          actions.push(...results);
+        }
+      } else {
+        console.error(`[kill-switch] ${usage.scriptName}: ${usage.requests.toLocaleString()} reqs - ok`);
       }
-
-      if (autoDelete) {
-        const result = await deleteWorker(env, usage.scriptName);
-        actions.push(result);
-      } else if (autoDisconnect) {
-        const results = await disconnectWorker(env, usage.scriptName);
-        actions.push(...results);
-      }
-    } else {
-      console.error(`[kill-switch] ${usage.scriptName}: ${usage.requests.toLocaleString()} reqs - ok`);
     }
+
+    // Check Worker request volume (catch feedback loops)
+    console.error("[kill-switch] Checking Worker request volumes...");
+    workerUsage = await queryWorkerUsage(env);
+
+    for (const usage of workerUsage) {
+      if (usage.requests > workerReqThreshold) {
+        const msg = `WORKER REQUEST SPIKE: ${usage.scriptName} - ${usage.requests.toLocaleString()} reqs today`;
+        violations.push(msg);
+        console.error(`[kill-switch] ${msg}`);
+
+        if (protectedWorkers.includes(usage.scriptName)) {
+          actions.push(`PROTECTED: ${usage.scriptName} request spike but is protected`);
+          continue;
+        }
+
+        if (autoDisconnect) {
+          const results = await disconnectWorker(env, usage.scriptName);
+          actions.push(...results);
+        }
+      }
+    }
+    // Check R2 operations
+    console.error("[kill-switch] Checking R2 usage...");
+    r2Usage = await queryR2Usage(env);
+    for (const usage of r2Usage) {
+      const totalOps = usage.classAOps + usage.classBOps;
+      if (totalOps > r2OpsThreshold) {
+        const cost = (usage.classAOps * 4.50 / 1e6) + (usage.classBOps * 0.36 / 1e6);
+        violations.push(`R2 OPS SPIKE: ${usage.bucketName} - ${totalOps.toLocaleString()} ops today (~$${cost.toFixed(2)})`);
+      }
+    }
+
+    // Check D1 usage
+    console.error("[kill-switch] Checking D1 usage...");
+    d1Usage = await queryD1Usage(env);
+    for (const usage of d1Usage) {
+      if (usage.rowsWritten > d1RowsWrittenThreshold) {
+        const cost = usage.rowsWritten * 1.00 / 1e6;
+        violations.push(`D1 WRITE SPIKE: ${usage.databaseId} - ${usage.rowsWritten.toLocaleString()} rows written (~$${cost.toFixed(2)})`);
+      }
+      if (usage.rowsRead > d1RowsReadThreshold) {
+        violations.push(`D1 READ SPIKE: ${usage.databaseId} - ${usage.rowsRead.toLocaleString()} rows read`);
+      }
+    }
+
+    // Check Queue usage
+    console.error("[kill-switch] Checking Queue usage...");
+    queueUsage = await queryQueueUsage(env);
+    for (const usage of queueUsage) {
+      const totalMsgs = usage.messagesProduced + usage.messagesConsumed;
+      if (totalMsgs > queueMsgThreshold) {
+        const cost = totalMsgs * 0.40 / 1e6;
+        violations.push(`QUEUE SPIKE: ${usage.queueId} - ${totalMsgs.toLocaleString()} messages (~$${cost.toFixed(2)})`);
+      }
+    }
+  } catch (e) {
+    console.error(`[kill-switch] Cloudflare check failed (GCP checks unaffected): ${e}`);
+    violations.push(`CF MONITORING ERROR: ${e}`);
   }
 
-  // Check Worker request volume (catch feedback loops)
-  console.error("[kill-switch] Checking Worker request volumes...");
-  const workerUsage = await queryWorkerUsage(env);
+  // Check GCP Cloud Run usage (wrapped in try/catch so GCP failures
+  // don't prevent Cloudflare violations from being alerted)
+  let cloudRunUsage: CloudRunServiceUsage[] = [];
+  try {
+    console.error("[kill-switch] Checking GCP Cloud Run usage...");
+    cloudRunUsage = await queryCloudRunUsage(env);
 
-  for (const usage of workerUsage) {
-    if (usage.requests > workerReqThreshold) {
-      const msg = `WORKER REQUEST SPIKE: ${usage.scriptName} - ${usage.requests.toLocaleString()} reqs today`;
-      violations.push(msg);
-      console.error(`[kill-switch] ${msg}`);
+    for (const usage of cloudRunUsage) {
+      const reqExceeded = usage.requests > crReqThreshold;
+      const instanceExceeded = usage.activeInstances > crInstanceThreshold;
+      const costExceeded = (usage.estimatedDailyCostUSD * 30) > crMonthlyCostThreshold;
 
-      if (protectedWorkers.includes(usage.scriptName)) {
-        actions.push(`PROTECTED: ${usage.scriptName} request spike but is protected`);
-        continue;
-      }
+      if (reqExceeded || instanceExceeded || costExceeded) {
+        const reasons: string[] = [];
+        if (reqExceeded) reasons.push(`${usage.requests.toLocaleString()} reqs`);
+        if (instanceExceeded) reasons.push(`${usage.activeInstances} active instances`);
+        if (costExceeded) reasons.push(`$${(usage.estimatedDailyCostUSD * 30).toFixed(0)}/mo estimated`);
 
-      if (autoDisconnect) {
-        const results = await disconnectWorker(env, usage.scriptName);
-        actions.push(...results);
+        const msg = `CLOUD RUN THRESHOLD EXCEEDED: ${usage.serviceName} - ${reasons.join(", ")}`;
+        violations.push(msg);
+        console.error(`[kill-switch] ${msg}`);
+
+        // Cloud Run auto-disconnect: set min/max instances to 0 via Cloud Run Admin API
+        // This is less destructive than deleting — just stops new instances from spinning up
+        if (autoDisconnect && env.GCP_SERVICE_ACCOUNT_JSON && env.GCP_PROJECT_ID) {
+          const action = await disableCloudRunService(env, usage.serviceName);
+          actions.push(action);
+        }
+      } else {
+        console.error(`[kill-switch] ${usage.serviceName}: ${usage.requests.toLocaleString()} reqs, ${usage.activeInstances} instances - ok`);
       }
     }
+  } catch (e) {
+    console.error(`[kill-switch] GCP Cloud Run check failed (CF alerts unaffected): ${e}`);
+    violations.push(`GCP MONITORING ERROR: ${e}`);
   }
 
   // Send alerts if any violations
   if (violations.length > 0) {
+    const providers = new Set<string>();
+    if (doUsage.length > 0 || workerUsage.length > 0) providers.add("Cloudflare");
+    if (cloudRunUsage.length > 0) providers.add("GCP");
+
     await sendAlerts(
       env,
-      `Cloudflare cost alert: ${violations.length} worker(s) exceeded thresholds`,
+      `Cost alert [${[...providers].join("+")}]: ${violations.length} service(s) exceeded thresholds`,
       "critical",
       {
         violations,
         actionsTaken: actions,
         autoDisconnect,
         autoDelete,
-        thresholds: { doReqThreshold, doWallThreshold, workerReqThreshold },
+        thresholds: {
+          doReqThreshold, doWallThreshold, workerReqThreshold,
+          crReqThreshold, crInstanceThreshold, crMonthlyCostThreshold,
+        },
         checkedAt: new Date().toISOString(),
       }
     );
@@ -440,7 +1010,45 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     console.error("[kill-switch] All usage within thresholds.");
   }
 
-  return { violations, actions, doUsage, workerUsage };
+  const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage };
+
+  // Report to kill-switch.net
+  await reportToKillSwitch(env, result);
+
+  return result;
+}
+
+async function disableCloudRunService(env: Env, serviceName: string): Promise<string> {
+  try {
+    const accessToken = await getGCPAccessToken(env.GCP_SERVICE_ACCOUNT_JSON!);
+    const projectId = env.GCP_PROJECT_ID!;
+    const region = env.GCP_REGION || "us-central1";
+
+    // Set max instances to 0 to stop new traffic (reversible via console or gcloud)
+    const res = await fetch(
+      `https://run.googleapis.com/v2/projects/${projectId}/locations/${region}/services/${serviceName}?updateMask=template.scaling.maxInstanceCount`,
+      {
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          template: {
+            scaling: { maxInstanceCount: 0 },
+          },
+        }),
+      }
+    );
+
+    if (res.ok) {
+      return `DISABLED Cloud Run service ${serviceName} (set maxInstances=0)`;
+    }
+    const text = await res.text();
+    return `Failed to disable Cloud Run ${serviceName}: ${res.status} ${text.substring(0, 100)}`;
+  } catch (e) {
+    return `Error disabling Cloud Run ${serviceName}: ${e}`;
+  }
 }
 
 // ─── Worker Entry Points ────────────────────────────────────────────────────
@@ -482,13 +1090,32 @@ export default {
     if (url.pathname === "/usage") {
       const doUsage = await queryDOUsage(env);
       const workerUsage = await queryWorkerUsage(env);
+      const r2Usage = await queryR2Usage(env);
+      const d1Usage = await queryD1Usage(env);
+      const queueUsage = await queryQueueUsage(env);
+      const cloudRunUsage = await queryCloudRunUsage(env);
       return Response.json({
         doUsage,
         workerUsage: workerUsage.slice(0, 20), // top 20 by requests
+        r2Usage,
+        d1Usage,
+        queueUsage,
+        cloudRunUsage,
         thresholds: {
           doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
           doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
           workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
+          r2Ops: parseInt(env.R2_OPS_THRESHOLD || "50000000"),
+          d1RowsWritten: parseInt(env.D1_ROWS_WRITTEN_THRESHOLD || "10000000"),
+          d1RowsRead: parseInt(env.D1_ROWS_READ_THRESHOLD || "500000000"),
+          queueMessages: parseInt(env.QUEUE_MESSAGES_THRESHOLD || "50000000"),
+          cloudRunRequests: parseInt(env.CLOUD_RUN_REQUEST_THRESHOLD || "5000000"),
+          cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "100"),
+          cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "8000"),
+        },
+        killSwitchNet: {
+          connected: !!env.KILL_SWITCH_AGENT_API_KEY,
+          apiUrl: env.KILL_SWITCH_API_URL || "https://api.kill-switch.net",
         },
         timestamp: new Date().toISOString(),
       });
@@ -498,11 +1125,30 @@ export default {
     return Response.json({
       service: "cloudflare-billing-kill-switch",
       status: "healthy",
-      schedule: "every 6 hours",
-      thresholds: {
-        doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
-        doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
-        workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
+      schedule: "every 5 minutes",
+      providers: {
+        cloudflare: {
+          connected: true,
+          thresholds: {
+            doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
+            doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
+            workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
+          },
+        },
+        gcp: {
+          connected: !!(env.GCP_SERVICE_ACCOUNT_JSON && env.GCP_PROJECT_ID),
+          projectId: env.GCP_PROJECT_ID || null,
+          region: env.GCP_REGION || "us-central1",
+          thresholds: {
+            cloudRunRequests: parseInt(env.CLOUD_RUN_REQUEST_THRESHOLD || "5000000"),
+            cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "50"),
+            cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "500"),
+          },
+        },
+      },
+      killSwitchNet: {
+        connected: !!env.KILL_SWITCH_AGENT_API_KEY,
+        apiUrl: env.KILL_SWITCH_API_URL || "https://api.kill-switch.net",
       },
       autoDisconnect: env.AUTO_DISCONNECT === "true",
       autoDelete: env.AUTO_DELETE === "true",

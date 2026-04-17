@@ -3,18 +3,24 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Check usage every 6 hours. Adjust as needed:
+# Check usage every 5 minutes. Adjust as needed:
 #   "*/5 * * * *"   = every 5 minutes (aggressive)
 #   "0 * * * *"     = every hour
 #   "0 */6 * * *"   = every 6 hours (default)
 #   "0 0 * * *"     = once daily
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 ENVIRONMENT = "production"
 
-# ── Thresholds ───────────────────────────────────────────────────────────────
+# ── Kill Switch Service (https://kill-switch.net) ────────────────────────────
+# Centralized monitoring & alerting. The agent reports usage metrics to
+# kill-switch.net after each check, enabling multi-cloud dashboards & rules.
+KILL_SWITCH_API_URL = "https://api.kill-switch.net"
+# KILL_SWITCH_AGENT_API_KEY → set via `wrangler secret put KILL_SWITCH_AGENT_API_KEY`
+
+# ── Cloudflare Thresholds ───────────────────────────────────────────────────
 # Alerts fire when ANY worker exceeds these thresholds in a single day.
 # Set based on your normal usage patterns. Start conservative, tune over time.
 
@@ -33,22 +39,59 @@ DO_WALLTIME_HOURS_THRESHOLD = "100"
 # $0.30/million after 10M free.
 WORKER_REQUEST_THRESHOLD = "10000000"
 
+# R2 operations per day (class A + B combined, default: 50 million)
+# Context: Class A (PUT/DELETE/LIST) = $4.50/million, Class B (GET/HEAD) = $0.36/million
+R2_OPS_THRESHOLD = "50000000"
+
+# D1 rows written per day (default: 10 million)
+# Context: $1.00/million rows written after 50M free/month
+D1_ROWS_WRITTEN_THRESHOLD = "10000000"
+
+# D1 rows read per day (default: 10 billion)
+# Context: $0.001/million rows read after 25B free/month. Very cheap.
+# Normal daily usage: ~4B reads across top databases.
+D1_ROWS_READ_THRESHOLD = "10000000000"
+
+# Queue messages per day (produced + consumed, default: 50 million)
+# Context: $0.40/million messages
+QUEUE_MESSAGES_THRESHOLD = "50000000"
+
+# ── GCP Cloud Run Thresholds ────────────────────────────────────────────────
+# Monitors Cloud Run services (public-api, public-api-live, webhook, open-parse).
+# GCP_SERVICE_ACCOUNT_JSON, GCP_PROJECT_ID → set via `wrangler secret put`
+GCP_REGION = "us-central1"
+
+# Daily Cloud Run requests before alerting (default: 5 million)
+CLOUD_RUN_REQUEST_THRESHOLD = "5000000"
+
+# Max concurrent Cloud Run instances before alerting (default: 100)
+# Context: Each instance = ~$0.09/hr (2 vCPU, 2GiB). 100 instances
+# running continuously = ~$216/day = ~$6,480/month.
+# Normal staging traffic peaks at ~30 instances during business hours.
+CLOUD_RUN_INSTANCE_THRESHOLD = "100"
+
+# Estimated monthly Cloud Run cost before alerting (default: $8000)
+# Note: staging server-api peaks at 30-40 instances during business hours
+# (~$170/day = $5,100/mo). Set with headroom above normal peaks.
+CLOUD_RUN_MONTHLY_COST_THRESHOLD = "8000"
+
 # ── Kill Switch Behavior ─────────────────────────────────────────────────────
 
 # Auto-disconnect routes when thresholds exceeded (RECOMMENDED)
-# Removes custom domains and disables workers.dev subdomain.
-# Reversible — worker code stays intact, just stops receiving traffic.
+# Cloudflare: Removes custom domains and disables workers.dev subdomain.
+# GCP Cloud Run: Sets maxInstances to 0 (stops new traffic).
+# Both are reversible — code stays intact.
 AUTO_DISCONNECT = "true"
 
 # Auto-delete workers when thresholds exceeded (NUCLEAR — use with caution)
-# Permanently deletes the worker script and all associated Durable Objects.
+# Only applies to Cloudflare Workers. Permanently deletes the worker script.
 # NOT reversible. Only enable if you'd rather lose code than money.
 AUTO_DELETE = "false"
 
 # Workers that should NEVER be killed, even if they exceed thresholds.
 # Comma-separated list of worker script names.
 # Always include this kill switch worker itself!
-PROTECTED_WORKERS = "cloudflare-billing-kill-switch"
+PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-agent-production"
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
 # Set these via `wrangler secret put <NAME>`
@@ -59,6 +102,17 @@ PROTECTED_WORKERS = "cloudflare-billing-kill-switch"
 #                             - Account Workers Scripts: Edit (for auto-disconnect)
 #                             - Account Workers Routes: Edit (for route removal)
 #   CLOUDFLARE_ACCOUNT_ID   — Your Cloudflare account ID
+#
+# KILL SWITCH SERVICE:
+#   KILL_SWITCH_AGENT_API_KEY — Agent API key from kill-switch.net dashboard
+#                               (enables centralized multi-cloud monitoring)
+#
+# GCP MONITORING:
+#   GCP_SERVICE_ACCOUNT_JSON — GCP service account JSON (needs roles:
+#                               - monitoring.viewer (read Cloud Monitoring metrics)
+#                               - run.developer (update service scaling)
+#                               - iam.serviceAccountUser (actAs for revisions))
+#   GCP_PROJECT_ID           — GCP project ID (e.g., "openai-api-4375643")
 #
 # ALERTING (at least one recommended):
 #   PAGERDUTY_ROUTING_KEY   — PagerDuty Events API v2 integration key

@@ -1,24 +1,30 @@
-# Cloudflare Billing Kill Switch
+# Cloudflare & GCP Billing Kill Switch
 
-**Auto-disconnect runaway Cloudflare Workers before they generate surprise bills.**
+**Auto-disconnect runaway cloud services before they generate surprise bills.**
 
-Born from an **$80,000 Durable Objects bill**. Cloudflare has no native spending cap — if a Worker enters a feedback loop or a Durable Object runs away, there's nothing stopping it from draining your account. This Worker is your safety net.
+Born from an **$80,000 Durable Objects bill**. Monitors both **Cloudflare Workers** and **GCP Cloud Run** services, with centralized reporting to [kill-switch.net](https://kill-switch.net).
 
 ## What It Does
 
 Every 6 hours (configurable), this Worker:
 
-1. Queries Cloudflare's GraphQL Analytics API for per-worker usage
-2. Checks Durable Object requests, wall-time, and Worker request volume against your thresholds
-3. If any worker exceeds limits:
+1. **Cloudflare**: Queries GraphQL Analytics API for per-worker DO requests, wall-time, and request volume
+2. **GCP Cloud Run**: Queries Cloud Monitoring API for request count, instance count, and estimated cost
+3. **Checks thresholds**: If any service exceeds limits:
    - **Alerts** you via PagerDuty (phone call), Discord, Slack, or custom webhook
-   - **Auto-disconnects** the offending worker by removing its routes and custom domains
-   - Worker code stays intact — just stops receiving traffic (reversible)
+   - **Auto-disconnects** the offending service (reversible):
+     - Cloudflare: removes routes and custom domains
+     - Cloud Run: sets maxInstances to 0
+4. **Reports to kill-switch.net**: Sends unified metrics from both providers for centralized dashboards and rule evaluation
 
 ```
-Normal:     Worker ← Traffic ← Routes/Domains
+Cloudflare:  Worker ← Traffic ← Routes/Domains
 Kill switch: Worker    Traffic ✗ Routes removed
                        ↑ Code intact, re-enable anytime
+
+Cloud Run:   Service ← Traffic ← Load Balancer
+Kill switch: Service    Traffic ✗ maxInstances=0
+                        ↑ Revision intact, scale back up anytime
 ```
 
 ## Quick Start
@@ -32,7 +38,7 @@ npm install
 wrangler deploy
 ```
 
-### 2. Set required secrets
+### 2. Set required secrets (Cloudflare)
 
 ```bash
 # Your Cloudflare account ID (from dashboard URL or API)
@@ -45,7 +51,26 @@ wrangler secret put CLOUDFLARE_ACCOUNT_ID
 wrangler secret put CLOUDFLARE_API_TOKEN
 ```
 
-### 3. Set up alerting (at least one)
+### 3. Connect kill-switch.net (centralized monitoring)
+
+```bash
+# Agent API key from https://kill-switch.net dashboard
+wrangler secret put KILL_SWITCH_AGENT_API_KEY
+```
+
+### 4. Connect GCP Cloud Run monitoring (optional)
+
+```bash
+# GCP project ID
+wrangler secret put GCP_PROJECT_ID
+# → Enter: openai-api-4375643 (or your project ID)
+
+# GCP service account JSON (needs monitoring.viewer + run.admin roles)
+wrangler secret put GCP_SERVICE_ACCOUNT_JSON
+# → Paste the full JSON contents of your service account key
+```
+
+### 5. Set up alerting (at least one)
 
 ```bash
 # PagerDuty (recommended for phone calls until acknowledged)
@@ -83,14 +108,31 @@ curl https://cloudflare-billing-kill-switch.<your-subdomain>.workers.dev/check
 
 All thresholds are set in `wrangler.toml` under `[vars]`:
 
+### Cloudflare Thresholds
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DO_REQUEST_THRESHOLD` | `1000000` | Max Durable Object requests per day before alerting |
 | `DO_WALLTIME_HOURS_THRESHOLD` | `100` | Max DO wall-time hours per day |
 | `WORKER_REQUEST_THRESHOLD` | `10000000` | Max Worker requests per day (catches feedback loops) |
-| `AUTO_DISCONNECT` | `true` | Auto-remove routes when threshold exceeded (reversible) |
-| `AUTO_DELETE` | `false` | Auto-delete worker script (nuclear, irreversible) |
+
+### GCP Cloud Run Thresholds
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLOUD_RUN_REQUEST_THRESHOLD` | `5000000` | Max Cloud Run requests per day |
+| `CLOUD_RUN_INSTANCE_THRESHOLD` | `50` | Max concurrent instances (50 × 2vCPU ≈ $108/day) |
+| `CLOUD_RUN_MONTHLY_COST_THRESHOLD` | `500` | Estimated monthly cost cap in USD |
+| `GCP_REGION` | `us-central1` | GCP region to monitor |
+
+### Kill Switch Behavior
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_DISCONNECT` | `true` | Auto-disconnect when threshold exceeded (reversible) |
+| `AUTO_DELETE` | `false` | Auto-delete CF workers (nuclear, irreversible, CF only) |
 | `PROTECTED_WORKERS` | `cloudflare-billing-kill-switch` | Comma-separated workers to never kill |
+| `KILL_SWITCH_API_URL` | `https://api.kill-switch.net` | Kill Switch service API URL |
 
 ### Cron Schedule
 
@@ -153,7 +195,9 @@ This Worker itself costs nearly nothing:
 - Each invocation: 2 GraphQL queries + optional alert webhooks
 - Well within the Workers free tier (100K requests/day)
 
-## Required API Token Permissions
+## Required Credentials
+
+### Cloudflare API Token
 
 Create a [Cloudflare API token](https://dash.cloudflare.com/profile/api-tokens) with:
 
@@ -164,6 +208,21 @@ Create a [Cloudflare API token](https://dash.cloudflare.com/profile/api-tokens) 
 | Account Workers Routes | Edit | Remove custom domain routes |
 
 If you only want alerting without auto-disconnect, `Account Analytics: Read` is sufficient.
+
+### GCP Service Account (for Cloud Run monitoring)
+
+Create a GCP service account with these roles:
+
+| Role | Why |
+|------|-----|
+| `roles/monitoring.viewer` | Read Cloud Monitoring metrics (request count, instance count) |
+| `roles/run.admin` | Set maxInstances=0 on threshold breach (auto-disconnect) |
+
+If you only want alerting without auto-disconnect, `roles/monitoring.viewer` is sufficient.
+
+### Kill Switch Agent API Key
+
+Get your agent API key from the [kill-switch.net dashboard](https://kill-switch.net). This enables centralized multi-cloud monitoring, rule evaluation, and the analytics dashboard.
 
 ## Alert Integrations
 
@@ -212,7 +271,9 @@ PRs welcome! Some ideas:
 - [ ] Daily cost estimate reports (email/Discord digest)
 - [ ] Dashboard UI (Pages site with historical data)
 - [ ] Hysteresis (trigger at 90%, recover at 85% to prevent oscillation)
-- [ ] GCP Cloud Run integration (multi-cloud kill switch)
+- [x] ~~GCP Cloud Run integration (multi-cloud kill switch)~~ — Done!
+- [x] ~~kill-switch.net centralized reporting~~ — Done!
+- [ ] AWS Lambda/ECS monitoring
 
 ## License
 
