@@ -30,9 +30,13 @@ KILL_SWITCH_API_URL = "https://api.kill-switch.net"
 # Alerts fire when ANY worker exceeds these thresholds in a single day.
 # Set based on your normal usage patterns. Start conservative, tune over time.
 
-# Durable Object requests per day (default: 1 million)
-# Context: DO requests cost $0.15/million. 1B requests = $150.
-DO_REQUEST_THRESHOLD = "1000000"
+# Durable Object requests per day (default: 10 million)
+# Context: DO requests cost $0.15/million — even 10M/day is only ~$1.50.
+# Tuned 2026-06-17: the as-above-voice-agent DO does ~1.5M reqs/day of LEGIT
+# voice traffic ($0.23/day); the old 1M threshold fired on it every check.
+# 10M gives ~6× headroom over current real usage while still catching a true
+# runaway (and the 10× DISCONNECT multiplier means kill only above 100M/day).
+DO_REQUEST_THRESHOLD = "10000000"
 
 # Durable Object wall-time per day in hours (default: 100 hours)
 # Context: DO duration costs $12.50/million GB-seconds. Long-running
@@ -105,8 +109,13 @@ VECTORIZE_DIMENSIONS_THRESHOLD = "500000000"
 # ── Account-wide catch-all ───────────────────────────────────────────────────
 # Total estimated daily spend ($) across CF-billable surfaces + GCP Cloud Run.
 # Safety net for cost in a service without its own threshold (Images, Stream,
-# KV, a new worker). Baseline ~$12/day; the 2026-06-15 spike hit ~$52.
-TOTAL_DAILY_SPEND_THRESHOLD = "50"
+# KV, a new worker).
+# Tuned 2026-06-17: the REAL total baseline is ~$130-140/day, dominated by GCP
+# Cloud Run (CF is only ~$12/day). The old $50 was sized off the CF-only
+# dashboard number and sat BELOW baseline, so it fired every single check. $300
+# is ~2.2× the real baseline — catches a genuine runaway without nagging. (GCP
+# also has its own CLOUD_RUN_MONTHLY_COST_THRESHOLD = $8000/mo ≈ $266/day.)
+TOTAL_DAILY_SPEND_THRESHOLD = "300"
 
 # ── Alert de-dup ─────────────────────────────────────────────────────────────
 # Suppress repeat Discord/Slack/custom alerts for the SAME violation set within
