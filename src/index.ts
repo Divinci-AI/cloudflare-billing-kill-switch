@@ -69,6 +69,7 @@ interface Env {
   // Kill switch behavior
   AUTO_DISCONNECT: string;   // "true" to auto-disconnect routes (reversible)
   AUTO_DELETE: string;       // "true" to auto-delete workers (nuclear, irreversible)
+  DISCONNECT_THRESHOLD_MULTIPLIER: string; // Auto-disconnect/delete only above N× the ALERT threshold (default 10). Alerts still fire at 1×.
   PROTECTED_WORKERS: string; // Comma-separated worker names to never kill
 
   ENVIRONMENT: string;
@@ -1085,6 +1086,10 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   const crMonthlyCostThreshold = parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "500");
   const autoDisconnect = env.AUTO_DISCONNECT === "true";
   const autoDelete = env.AUTO_DELETE === "true";
+  // Auto-disconnect/delete only on a genuine runaway — N× the alert threshold.
+  // Alerts still fire at 1×; this just keeps the destructive action from tripping
+  // on ordinary over-threshold traffic. Guard against a foot-gun value of <1.
+  const disconnectMultiplier = Math.max(1, parseFloat(env.DISCONNECT_THRESHOLD_MULTIPLIER || "10"));
   const protectedWorkers = (env.PROTECTED_WORKERS || "").split(",").map(s => s.trim()).filter(Boolean);
 
   const violations: string[] = [];
@@ -1128,7 +1133,12 @@ async function checkUsage(env: Env): Promise<CheckResult> {
           continue;
         }
 
-        if (autoDelete) {
+        // Destructive action only on a genuine runaway (N× the alert threshold).
+        const runaway = usage.requests > doReqThreshold * disconnectMultiplier
+          || usage.wallTimeHours > doWallThreshold * disconnectMultiplier;
+        if (!runaway) {
+          console.error(`[kill-switch] ${usage.scriptName}: over alert threshold but below ${disconnectMultiplier}× kill threshold — alert only`);
+        } else if (autoDelete) {
           const result = await deleteWorker(env, usage.scriptName);
           actions.push(result);
         } else if (autoDisconnect) {
@@ -1155,7 +1165,10 @@ async function checkUsage(env: Env): Promise<CheckResult> {
           continue;
         }
 
-        if (autoDisconnect) {
+        // Disconnect only on a genuine runaway (N× the alert threshold).
+        if (usage.requests <= workerReqThreshold * disconnectMultiplier) {
+          console.error(`[kill-switch] ${usage.scriptName}: over alert threshold but below ${disconnectMultiplier}× kill threshold — alert only`);
+        } else if (autoDisconnect) {
           const results = await disconnectWorker(env, usage.scriptName);
           actions.push(...results);
         }
@@ -1277,9 +1290,16 @@ async function checkUsage(env: Env): Promise<CheckResult> {
         violations.push(msg);
         console.error(`[kill-switch] ${msg}`);
 
+        // Scale-to-zero only on a genuine runaway (N× the alert threshold).
+        const runaway = usage.requests > crReqThreshold * disconnectMultiplier
+          || usage.activeInstances > crInstanceThreshold * disconnectMultiplier
+          || (usage.estimatedDailyCostUSD * 30) > crMonthlyCostThreshold * disconnectMultiplier;
+
         // Cloud Run auto-disconnect: set min/max instances to 0 via Cloud Run Admin API
         // This is less destructive than deleting — just stops new instances from spinning up
-        if (autoDisconnect && env.GCP_SERVICE_ACCOUNT_JSON && env.GCP_PROJECT_ID) {
+        if (!runaway) {
+          console.error(`[kill-switch] ${usage.serviceName}: over alert threshold but below ${disconnectMultiplier}× kill threshold — alert only`);
+        } else if (autoDisconnect && env.GCP_SERVICE_ACCOUNT_JSON && env.GCP_PROJECT_ID) {
           const action = await disableCloudRunService(env, usage.serviceName);
           actions.push(action);
         }
@@ -1367,6 +1387,7 @@ async function checkUsage(env: Env): Promise<CheckResult> {
           crReqThreshold, crInstanceThreshold, crMonthlyCostThreshold,
           totalDailySpendThreshold,
         },
+        disconnectThresholdMultiplier: disconnectMultiplier,
         checkedAt: new Date().toISOString(),
       },
       "",
@@ -1727,6 +1748,8 @@ export default {
       },
       autoDisconnect: env.AUTO_DISCONNECT === "true",
       autoDelete: env.AUTO_DELETE === "true",
+      disconnectThresholdMultiplier: Math.max(1, parseFloat(env.DISCONNECT_THRESHOLD_MULTIPLIER || "10")),
+      disconnectNote: "Alerts fire at 1× the thresholds; auto-disconnect/delete only triggers above this multiple of them (genuine runaway).",
       protectedWorkers: (env.PROTECTED_WORKERS || "").split(",").filter(Boolean),
       alertDestinations: {
         pagerduty: !!env.PAGERDUTY_ROUTING_KEY,

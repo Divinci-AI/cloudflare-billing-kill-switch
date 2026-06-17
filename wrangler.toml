@@ -148,6 +148,14 @@ AUTO_DISCONNECT = "true"
 # NOT reversible. Only enable if you'd rather lose code than money.
 AUTO_DELETE = "false"
 
+# Runaway guard: auto-disconnect/delete only fires when usage exceeds this
+# MULTIPLE of the alert threshold — alerts still fire at 1×. This keeps the
+# kill switch armed for genuine runaways while ordinary over-threshold traffic
+# only alerts (never gets auto-disconnected). E.g. with 10×, a worker alerts at
+# 10M reqs/day but is only auto-disconnected above 100M/day. Applies to Workers,
+# Durable Objects, and Cloud Run. Minimum effective value is 1.
+DISCONNECT_THRESHOLD_MULTIPLIER = "10"
+
 # Workers that should NEVER be killed, even if they exceed thresholds.
 # Comma-separated list of worker script names.
 # Always include this kill switch worker itself!
