@@ -11,6 +11,12 @@ compatibility_flags = ["nodejs_compat"]
 [triggers]
 crons = ["*/5 * * * *"]
 
+# Alert de-dup state (edge-triggered webhook alerts). Optional: if removed,
+# de-dup becomes a no-op and chatty channels repeat every check.
+[[kv_namespaces]]
+binding = "ALERT_STATE"
+id = "70af5e6edb8b414ab96f6bbb0618b4be"
+
 [vars]
 ENVIRONMENT = "production"
 
@@ -83,6 +89,32 @@ SDK_DOCS_ERROR_THRESHOLD = "100"
 # NOTE: alert-only — there is no CF API to throttle Workers AI per-model;
 # mitigate in-app by dropping the offending model from the fallback chain.
 AI_NEURONS_THRESHOLD = "500000"
+
+# ── AI Gateway (external-provider LLM cost) ──────────────────────────────────
+# Daily upstream-provider cost ($) routed through AI Gateway before alerting.
+# This is spend billed by Gemini/Vertex/OpenAI (NOT the CF bill) — it catches
+# LLM cost that Workers AI Neurons monitoring can't see. $0 for the workers-ai
+# provider (Neurons bills that). Baseline ~$0.20/day; $5 catches a real spike.
+AI_GATEWAY_COST_THRESHOLD = "5"
+
+# ── Vectorize ────────────────────────────────────────────────────────────────
+# Daily queried vector dimensions before alerting ($0.01 / 1M dims).
+# 500M dims ≈ $5/day. Near-zero here (Qdrant-primary; Vectorize is cache-only).
+VECTORIZE_DIMENSIONS_THRESHOLD = "500000000"
+
+# ── Account-wide catch-all ───────────────────────────────────────────────────
+# Total estimated daily spend ($) across CF-billable surfaces + GCP Cloud Run.
+# Safety net for cost in a service without its own threshold (Images, Stream,
+# KV, a new worker). Baseline ~$12/day; the 2026-06-15 spike hit ~$52.
+TOTAL_DAILY_SPEND_THRESHOLD = "50"
+
+# ── Alert de-dup ─────────────────────────────────────────────────────────────
+# Suppress repeat Discord/Slack/custom alerts for the SAME violation set within
+# this many hours. The cron runs every 5 min and daily-cumulative thresholds
+# stay tripped all day once crossed — without this they'd repeat ~288×/day.
+# PagerDuty is unaffected (it self-dedups via dedup_key). Requires the
+# ALERT_STATE KV binding below; if unbound, de-dup is a no-op (alerts repeat).
+ALERT_COOLDOWN_HOURS = "6"
 
 # ── GCP Cloud Run Thresholds ────────────────────────────────────────────────
 # Monitors Cloud Run services (public-api, public-api-live, webhook, open-parse).

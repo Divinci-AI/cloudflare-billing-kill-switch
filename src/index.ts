@@ -57,6 +57,15 @@ interface Env {
   // Workers AI (LLM inference) monitoring threshold
   AI_NEURONS_THRESHOLD: string;          // Daily Workers AI Neurons before alerting (default: 500000 ≈ $5.50/day)
 
+  // AI Gateway (external-provider LLM cost) + Vectorize thresholds
+  AI_GATEWAY_COST_THRESHOLD: string;     // Daily AI Gateway provider cost ($) before alerting (default: 5)
+  VECTORIZE_DIMENSIONS_THRESHOLD: string; // Daily Vectorize queried dimensions before alerting (default: 500000000 ≈ $5)
+
+  // Account-wide catch-all + alert de-dup
+  TOTAL_DAILY_SPEND_THRESHOLD: string;   // Total estimated daily CF+GCP spend ($) before alerting (default: 50)
+  ALERT_COOLDOWN_HOURS: string;          // Suppress repeat webhook alerts for the same violation set (default: 6)
+  ALERT_STATE?: KVNamespace;             // Optional KV binding for alert de-dup state (no-op if unbound)
+
   // Kill switch behavior
   AUTO_DISCONNECT: string;   // "true" to auto-disconnect routes (reversible)
   AUTO_DELETE: string;       // "true" to auto-delete workers (nuclear, irreversible)
@@ -118,6 +127,30 @@ interface AiUsage {
 // Cloudflare Workers AI pricing: $0.011 per 1,000 Neurons → $0.000011 / Neuron.
 const NEURON_COST_USD = 0.011 / 1000;
 
+// Vectorize pricing: $0.01 per 1,000,000 queried vector dimensions.
+const VECTORIZE_DIM_COST_USD = 0.01 / 1_000_000;
+
+// AI Gateway inference usage (cost the gateway attributes to the UPSTREAM
+// provider — e.g. google-ai-studio / vertex / openai). Complements Workers AI
+// Neurons monitoring: gateway `cost` is $0 for the workers-ai provider (Neurons
+// bills that), but non-zero for external providers that Neurons can't see.
+interface AiGatewayUsage {
+  gateway: string;
+  provider: string;
+  requests: number;
+  cost: number;            // USD, as attributed by AI Gateway
+  erroredRequests: number;
+  cachedRequests: number;
+}
+
+// Vectorize query usage. Billed on queried vector dimensions. Near-zero for
+// Qdrant-primary setups (Vectorize is only a cache here) — monitored for
+// completeness / future-proofing.
+interface VectorizeUsage {
+  indexId: string;
+  queriedDimensions: number;
+}
+
 interface CheckResult {
   violations: string[];
   actions: string[];
@@ -128,6 +161,8 @@ interface CheckResult {
   queueUsage: QueueUsage[];
   cloudRunUsage: CloudRunServiceUsage[];
   aiUsage: AiUsage[];
+  aiGatewayUsage: AiGatewayUsage[];
+  vectorizeUsage: VectorizeUsage[];
 }
 
 // ─── Cloudflare GraphQL Analytics ───────────────────────────────────────────
@@ -229,6 +264,83 @@ async function queryAiInferenceUsage(env: Env): Promise<AiUsage[]> {
     entry.outputTokens += g.sum?.totalOutputTokens ?? 0;
   }
   return [...byModel.values()].sort((a, b) => b.neurons - a.neurons);
+}
+
+// queryAiGatewayUsage — AI Gateway request/cost usage grouped by gateway +
+// upstream provider for today (aiGatewayRequestsAdaptiveGroups). The `cost`
+// sum is what the gateway attributes to the upstream provider, so this catches
+// external-provider LLM spend (Gemini/Vertex/OpenAI) that Workers AI Neurons
+// monitoring cannot see. Safe-degrades to [] without the analytics scope.
+async function queryAiGatewayUsage(env: Env): Promise<AiGatewayUsage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        aiGatewayRequestsAdaptiveGroups(
+          limit: 100,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_cost_DESC]
+        ) {
+          dimensions { gateway provider }
+          count
+          sum { cost erroredRequests cachedRequests }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  const byKey = new Map<string, AiGatewayUsage>();
+  const groups = data?.data?.viewer?.accounts?.[0]?.aiGatewayRequestsAdaptiveGroups ?? [];
+  for (const g of groups) {
+    const gateway = g.dimensions.gateway ?? "unknown";
+    const provider = g.dimensions.provider ?? "unknown";
+    const key = `${gateway}|${provider}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, { gateway, provider, requests: 0, cost: 0, erroredRequests: 0, cachedRequests: 0 });
+    }
+    const entry = byKey.get(key)!;
+    entry.requests += g.count ?? 0;
+    entry.cost += g.sum?.cost ?? 0;
+    entry.erroredRequests += g.sum?.erroredRequests ?? 0;
+    entry.cachedRequests += g.sum?.cachedRequests ?? 0;
+  }
+  return [...byKey.values()].sort((a, b) => b.cost - a.cost);
+}
+
+// queryVectorizeUsage — Vectorize queried-dimensions usage per index for today
+// (vectorizeQueriesAdaptiveGroups; note: this dataset has no `count` field).
+// Safe-degrades to [] without the analytics scope.
+async function queryVectorizeUsage(env: Env): Promise<VectorizeUsage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        vectorizeQueriesAdaptiveGroups(
+          limit: 100,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_queriedVectorDimensions_DESC]
+        ) {
+          dimensions { vectorizeIndexId }
+          sum { queriedVectorDimensions }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  const byIndex = new Map<string, VectorizeUsage>();
+  const groups = data?.data?.viewer?.accounts?.[0]?.vectorizeQueriesAdaptiveGroups ?? [];
+  for (const g of groups) {
+    const indexId = g.dimensions.vectorizeIndexId ?? "unknown";
+    if (!byIndex.has(indexId)) byIndex.set(indexId, { indexId, queriedDimensions: 0 });
+    byIndex.get(indexId)!.queriedDimensions += g.sum?.queriedVectorDimensions ?? 0;
+  }
+  return [...byIndex.values()].sort((a, b) => b.queriedDimensions - a.queriedDimensions);
 }
 
 // cfGraphQLSafe — like cfGraphQL but returns null instead of throwing on errors.
@@ -647,6 +759,23 @@ async function reportToKillSwitch(
       workerRequests: cr.requests,
       estimatedDailyCostUSD: cr.estimatedDailyCostUSD,
     })),
+    // Workers AI (Neurons) — the cost center behind the 2026-06-15 spike.
+    ...result.aiUsage.map((a) => ({
+      name: `cf-ai:${a.modelId}`,
+      doRequests: 0,
+      workerRequests: 0,
+      estimatedDailyCostUSD: a.neurons * NEURON_COST_USD,
+    })),
+    // AI Gateway upstream-provider cost (Gemini/Vertex/OpenAI) — external spend
+    // that Neurons can't see. Skip zero-cost rows (e.g. the workers-ai provider).
+    ...result.aiGatewayUsage
+      .filter((g) => g.cost > 0)
+      .map((g) => ({
+        name: `cf-aigw:${g.gateway}/${g.provider}`,
+        doRequests: 0,
+        workerRequests: 0,
+        estimatedDailyCostUSD: g.cost,
+      })),
   ];
 
   const totalCost = services.reduce((sum, s) => sum + s.estimatedDailyCostUSD, 0);
@@ -754,29 +883,77 @@ async function deleteWorker(env: Env, scriptName: string): Promise<string> {
 
 // ─── Alerting ───────────────────────────────────────────────────────────────
 
+// djb2 — tiny stable string hash for de-dup keys (no crypto needed).
+function djb2(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16);
+}
+
+// shouldSuppressWebhookAlerts — edge-triggered alerting for the chatty
+// webhook channels (Discord/Slack/custom). The cron runs every 5 min and
+// daily-cumulative thresholds (Neurons, requests, rows) stay tripped for the
+// rest of the day once crossed — without this, each channel would repeat the
+// same alert ~288×/day. PagerDuty is unaffected (it self-dedups via dedup_key).
+//
+// Keyed by a value-independent signature of the violation set (digits stripped)
+// scoped to the day; presence of the KV key within its TTL = inside the cooldown
+// window, so we suppress. No KV binding → returns false (current behaviour).
+async function shouldSuppressWebhookAlerts(env: Env, violations: string[]): Promise<boolean> {
+  if (!env.ALERT_STATE) return false;
+  const cooldownHours = parseFloat(env.ALERT_COOLDOWN_HOURS || "6");
+  if (cooldownHours <= 0) return false;
+
+  const today = new Date().toISOString().split("T")[0];
+  const signature = violations
+    .map(v => v.replace(/[\d.,$%]+/g, "#"))
+    .sort()
+    .join("|");
+  const key = `alert:${today}:${djb2(signature)}`;
+
+  try {
+    const seen = await env.ALERT_STATE.get(key);
+    if (seen) return true; // within cooldown — suppress chatty channels
+    await env.ALERT_STATE.put(key, new Date().toISOString(), {
+      expirationTtl: Math.max(60, Math.round(cooldownHours * 3600)),
+    });
+    return false;
+  } catch (e) {
+    console.error(`[kill-switch] alert de-dup KV error (failing open): ${e}`);
+    return false; // never let de-dup state swallow a real alert
+  }
+}
+
 async function sendAlerts(
   env: Env,
   summary: string,
   severity: "critical" | "error" | "warning" | "info",
   details: Record<string, unknown>,
-  dedupSuffix = ""
+  dedupSuffix = "",
+  suppressWebhooks = false
 ): Promise<void> {
   const promises: Promise<void>[] = [];
 
+  // PagerDuty always fires — it collapses repeats into a single incident via
+  // dedup_key, so it's safe to re-trigger every check (keeps the incident live).
   if (env.PAGERDUTY_ROUTING_KEY) {
     promises.push(alertPagerDuty(env, summary, severity, details, dedupSuffix));
   }
-  if (env.DISCORD_WEBHOOK_URL) {
-    promises.push(alertDiscord(env, summary, severity, details));
-  }
-  if (env.SLACK_WEBHOOK_URL) {
-    promises.push(alertSlack(env, summary, severity, details));
-  }
-  if (env.CUSTOM_WEBHOOK_URL) {
-    promises.push(alertCustomWebhook(env, summary, severity, details));
+  if (suppressWebhooks) {
+    console.error("[kill-switch] Webhook channels suppressed (within alert cooldown); PagerDuty still notified.");
+  } else {
+    if (env.DISCORD_WEBHOOK_URL) {
+      promises.push(alertDiscord(env, summary, severity, details));
+    }
+    if (env.SLACK_WEBHOOK_URL) {
+      promises.push(alertSlack(env, summary, severity, details));
+    }
+    if (env.CUSTOM_WEBHOOK_URL) {
+      promises.push(alertCustomWebhook(env, summary, severity, details));
+    }
   }
 
-  if (promises.length === 0) {
+  if (promises.length === 0 && !suppressWebhooks) {
     console.error("[kill-switch] WARNING: No alert destinations configured. Set at least one of: PAGERDUTY_ROUTING_KEY, DISCORD_WEBHOOK_URL, SLACK_WEBHOOK_URL, CUSTOM_WEBHOOK_URL");
   }
 
@@ -918,6 +1095,9 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   const d1RowsReadThreshold = parseInt(env.D1_ROWS_READ_THRESHOLD || "500000000");
   const queueMsgThreshold = parseInt(env.QUEUE_MESSAGES_THRESHOLD || "50000000");
   const aiNeuronsThreshold = parseInt(env.AI_NEURONS_THRESHOLD || "500000");
+  const aiGatewayCostThreshold = parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5");
+  const vectorizeDimsThreshold = parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000");
+  const totalDailySpendThreshold = parseFloat(env.TOTAL_DAILY_SPEND_THRESHOLD || "50");
 
   // Check Cloudflare usage (wrapped in try/catch so CF failures
   // don't prevent GCP checks or kill-switch.net reporting)
@@ -927,6 +1107,8 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   let d1Usage: D1Usage[] = [];
   let queueUsage: QueueUsage[] = [];
   let aiUsage: AiUsage[] = [];
+  let aiGatewayUsage: AiGatewayUsage[] = [];
+  let vectorizeUsage: VectorizeUsage[] = [];
   try {
     // Check DO usage
     console.error("[kill-switch] Checking Durable Object usage...");
@@ -1035,6 +1217,39 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     } else {
       console.error(`[kill-switch] Workers AI: ${Math.round(totalNeurons).toLocaleString()} Neurons (~$${(totalNeurons * NEURON_COST_USD).toFixed(2)}) - ok`);
     }
+
+    // Check AI Gateway — external-provider LLM cost (Gemini/Vertex/OpenAI)
+    // routed through the gateway, which Workers AI Neurons monitoring can't see.
+    console.error("[kill-switch] Checking AI Gateway usage...");
+    aiGatewayUsage = await queryAiGatewayUsage(env);
+    const totalGatewayCost = aiGatewayUsage.reduce((s, g) => s + g.cost, 0);
+    if (totalGatewayCost > aiGatewayCostThreshold) {
+      const top = aiGatewayUsage
+        .filter(g => g.cost > 0)
+        .slice(0, 3)
+        .map(g => `${g.gateway}/${g.provider} ($${g.cost.toFixed(2)})`)
+        .join(", ");
+      const msg = `AI GATEWAY SPIKE: ~$${totalGatewayCost.toFixed(2)} provider cost today — top: ${top}`;
+      violations.push(msg);
+      console.error(`[kill-switch] ${msg}`);
+    } else {
+      console.error(`[kill-switch] AI Gateway: ~$${totalGatewayCost.toFixed(2)} provider cost - ok`);
+    }
+
+    // Check Vectorize — queried vector dimensions (billable unit). Near-zero
+    // for Qdrant-primary setups; monitored for completeness.
+    console.error("[kill-switch] Checking Vectorize usage...");
+    vectorizeUsage = await queryVectorizeUsage(env);
+    const totalQueriedDims = vectorizeUsage.reduce((s, v) => s + v.queriedDimensions, 0);
+    if (totalQueriedDims > vectorizeDimsThreshold) {
+      const cost = totalQueriedDims * VECTORIZE_DIM_COST_USD;
+      const top = vectorizeUsage.slice(0, 3).map(v => `${v.indexId} (${v.queriedDimensions.toLocaleString()})`).join(", ");
+      const msg = `VECTORIZE SPIKE: ${totalQueriedDims.toLocaleString()} queried dimensions today (~$${cost.toFixed(2)}) — top: ${top}`;
+      violations.push(msg);
+      console.error(`[kill-switch] ${msg}`);
+    } else {
+      console.error(`[kill-switch] Vectorize: ${totalQueriedDims.toLocaleString()} queried dimensions - ok`);
+    }
   } catch (e) {
     console.error(`[kill-switch] Cloudflare check failed (GCP checks unaffected): ${e}`);
     violations.push(`CF MONITORING ERROR: ${e}`);
@@ -1107,11 +1322,35 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     }
   }
 
+  // ── Account-wide catch-all ───────────────────────────────────────
+  // Sum the main billable CF surfaces + Workers AI + GCP Cloud Run and alert
+  // if the day's total crosses TOTAL_DAILY_SPEND_THRESHOLD. This is the safety
+  // net for cost in a service we DON'T have a dedicated threshold for (Images,
+  // Stream, KV, a brand-new worker, etc.). Mirrors the /spend total; AI Gateway
+  // external-provider cost is excluded here (billed off-CF, has its own check).
+  const totalEstDailySpend =
+    doUsage.reduce((s, d) => s + (d.requests * 0.00000015) + (d.wallTimeHours * 12.50 / 1000), 0) +
+    workerUsage.reduce((s, w) => s + w.requests * 0.0000003, 0) +
+    r2Usage.reduce((s, r) => s + (r.classAOps * 4.50 / 1e6) + (r.classBOps * 0.36 / 1e6), 0) +
+    aiUsage.reduce((s, a) => s + a.neurons * NEURON_COST_USD, 0) +
+    cloudRunUsage.reduce((s, cr) => s + cr.estimatedDailyCostUSD, 0);
+  if (totalEstDailySpend > totalDailySpendThreshold) {
+    const msg = `TOTAL DAILY SPEND: ~$${totalEstDailySpend.toFixed(2)} estimated today (threshold $${totalDailySpendThreshold})`;
+    violations.push(msg);
+    console.error(`[kill-switch] ${msg}`);
+  } else {
+    console.error(`[kill-switch] Total estimated daily spend: ~$${totalEstDailySpend.toFixed(2)} (threshold $${totalDailySpendThreshold}) - ok`);
+  }
+
   // Send alerts if any violations
   if (violations.length > 0) {
     const providers = new Set<string>();
     if (doUsage.length > 0 || workerUsage.length > 0) providers.add("Cloudflare");
     if (cloudRunUsage.length > 0) providers.add("GCP");
+
+    // Edge-trigger the chatty webhook channels so a day-long tripped threshold
+    // doesn't repeat ~288×/day. PagerDuty still fires (self-dedups).
+    const suppressWebhooks = await shouldSuppressWebhookAlerts(env, violations);
 
     await sendAlerts(
       env,
@@ -1122,18 +1361,22 @@ async function checkUsage(env: Env): Promise<CheckResult> {
         actionsTaken: actions,
         autoDisconnect,
         autoDelete,
+        totalEstimatedDailySpendUSD: Math.round(totalEstDailySpend * 100) / 100,
         thresholds: {
           doReqThreshold, doWallThreshold, workerReqThreshold,
           crReqThreshold, crInstanceThreshold, crMonthlyCostThreshold,
+          totalDailySpendThreshold,
         },
         checkedAt: new Date().toISOString(),
-      }
+      },
+      "",
+      suppressWebhooks
     );
   } else {
     console.error("[kill-switch] All usage within thresholds.");
   }
 
-  const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage, aiUsage };
+  const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage, aiUsage, aiGatewayUsage, vectorizeUsage };
 
   // Report to kill-switch.net
   await reportToKillSwitch(env, result);
@@ -1219,6 +1462,8 @@ export default {
       let queueUsage: QueueUsage[] = [];
       let cloudRunUsage: CloudRunServiceUsage[] = [];
       let aiUsage: AiUsage[] = [];
+      let aiGatewayUsage: AiGatewayUsage[] = [];
+      let vectorizeUsage: VectorizeUsage[] = [];
       const errors: string[] = [];
 
       try { doUsage = await queryDOUsage(env); } catch (e) { errors.push(`do:${e}`); }
@@ -1228,6 +1473,8 @@ export default {
       try { queueUsage = await queryQueueUsage(env); } catch (e) { errors.push(`queues:${e}`); }
       try { cloudRunUsage = await queryCloudRunUsage(env); } catch (e) { errors.push(`cloudrun:${e}`); }
       try { aiUsage = await queryAiInferenceUsage(env); } catch (e) { errors.push(`ai:${e}`); }
+      try { aiGatewayUsage = await queryAiGatewayUsage(env); } catch (e) { errors.push(`aigateway:${e}`); }
+      try { vectorizeUsage = await queryVectorizeUsage(env); } catch (e) { errors.push(`vectorize:${e}`); }
 
       const doCosts = doUsage.map(d => ({
         scriptName: d.scriptName,
@@ -1276,12 +1523,31 @@ export default {
         estimatedDailyCostUSD: Math.round(a.neurons * NEURON_COST_USD * 100) / 100,
       }));
 
+      const aiGatewayCosts = aiGatewayUsage.map(g => ({
+        gateway: g.gateway,
+        provider: g.provider,
+        requests: g.requests,
+        erroredRequests: g.erroredRequests,
+        cachedRequests: g.cachedRequests,
+        estimatedDailyCostUSD: Math.round(g.cost * 100) / 100,
+      }));
+
+      const vectorizeCosts = vectorizeUsage.map(v => ({
+        indexId: v.indexId,
+        queriedDimensions: v.queriedDimensions,
+        estimatedDailyCostUSD: Math.round(v.queriedDimensions * VECTORIZE_DIM_COST_USD * 100) / 100,
+      }));
+
       const totalDOSpend = doCosts.reduce((s, d) => s + d.estimatedDailyCostUSD, 0);
       const totalWorkerSpend = workerCosts.reduce((s, w) => s + w.estimatedDailyCostUSD, 0);
       const totalCloudRunSpend = cloudRunCosts.reduce((s, cr) => s + cr.estimatedDailyCostUSD, 0);
       const totalR2Spend = r2Costs.reduce((s, r) => s + r.estimatedDailyCostUSD, 0);
       const totalAiSpend = Math.round(aiUsage.reduce((s, a) => s + a.neurons, 0) * NEURON_COST_USD * 100) / 100;
-      const totalDailySpend = Math.round((totalDOSpend + totalWorkerSpend + totalCloudRunSpend + totalR2Spend + totalAiSpend) * 100) / 100;
+      const totalAiGatewaySpend = Math.round(aiGatewayUsage.reduce((s, g) => s + g.cost, 0) * 100) / 100;
+      const totalVectorizeSpend = Math.round(vectorizeUsage.reduce((s, v) => s + v.queriedDimensions, 0) * VECTORIZE_DIM_COST_USD * 100) / 100;
+      // Headline total = CF-billable + Cloud Run. AI Gateway cost is billed by
+      // the upstream provider (off-CF), so it's surfaced separately, not summed.
+      const totalDailySpend = Math.round((totalDOSpend + totalWorkerSpend + totalCloudRunSpend + totalR2Spend + totalAiSpend + totalVectorizeSpend) * 100) / 100;
 
       const sdkDocsWorkers = workerCosts.filter(w =>
         w.scriptName.includes("divinci-sdk-docs")
@@ -1297,9 +1563,14 @@ export default {
               workers: totalWorkerSpend,
               r2: totalR2Spend,
               workersAI: totalAiSpend,
+              vectorize: totalVectorizeSpend,
             },
             gcp: {
               cloudRun: totalCloudRunSpend,
+            },
+            external: {
+              // Billed by upstream LLM providers (off the CF bill), tracked via AI Gateway.
+              aiGatewayProviders: totalAiGatewaySpend,
             },
           },
         },
@@ -1321,6 +1592,8 @@ export default {
           })),
           cloudRun: cloudRunCosts,
           workersAI: aiCosts,
+          aiGateway: aiGatewayCosts,
+          vectorize: vectorizeCosts,
         },
         workersAI: {
           models: aiCosts,
@@ -1331,6 +1604,18 @@ export default {
             neurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
             approxUSD: Math.round(parseInt(env.AI_NEURONS_THRESHOLD || "500000") * NEURON_COST_USD * 100) / 100,
           },
+        },
+        aiGateway: {
+          providers: aiGatewayCosts,
+          estimatedDailyCostUSD: totalAiGatewaySpend,
+          note: "Upstream-provider LLM cost (Gemini/Vertex/OpenAI). $0 for the workers-ai provider — Neurons bills that separately.",
+          threshold: { cost: parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5") },
+        },
+        vectorize: {
+          indexes: vectorizeCosts,
+          totalQueriedDimensions: vectorizeUsage.reduce((s, v) => s + v.queriedDimensions, 0),
+          estimatedDailyCostUSD: totalVectorizeSpend,
+          threshold: { queriedDimensions: parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000") },
         },
         sdkDocs: {
           workers: sdkDocsWorkers,
@@ -1351,6 +1636,9 @@ export default {
           cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "100"),
           cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "8000"),
           aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+          aiGatewayCost: parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5"),
+          vectorizeDimensions: parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000"),
+          totalDailySpend: parseFloat(env.TOTAL_DAILY_SPEND_THRESHOLD || "50"),
         },
         errors: errors.length > 0 ? errors : undefined,
         autoDisconnect: env.AUTO_DISCONNECT === "true",
@@ -1368,6 +1656,8 @@ export default {
       const queueUsage = await queryQueueUsage(env);
       const cloudRunUsage = await queryCloudRunUsage(env);
       const aiUsage = await queryAiInferenceUsage(env);
+      const aiGatewayUsage = await queryAiGatewayUsage(env);
+      const vectorizeUsage = await queryVectorizeUsage(env);
       return Response.json({
         doUsage,
         workerUsage: workerUsage.slice(0, 20), // top 20 by requests
@@ -1376,6 +1666,8 @@ export default {
         queueUsage,
         cloudRunUsage,
         aiUsage,
+        aiGatewayUsage,
+        vectorizeUsage,
         thresholds: {
           doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
           doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
@@ -1388,6 +1680,9 @@ export default {
           cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "100"),
           cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "8000"),
           aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+          aiGatewayCost: parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5"),
+          vectorizeDimensions: parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000"),
+          totalDailySpend: parseFloat(env.TOTAL_DAILY_SPEND_THRESHOLD || "50"),
         },
         killSwitchNet: {
           connected: !!env.KILL_SWITCH_AGENT_API_KEY,
@@ -1410,6 +1705,9 @@ export default {
             doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
             workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
             aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+            aiGatewayCost: parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5"),
+            vectorizeDimensions: parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000"),
+            totalDailySpend: parseFloat(env.TOTAL_DAILY_SPEND_THRESHOLD || "50"),
           },
         },
         gcp: {
@@ -1448,6 +1746,24 @@ export default {
         neuronThreshold: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
         approxCostThresholdUSD: Math.round(parseInt(env.AI_NEURONS_THRESHOLD || "500000") * NEURON_COST_USD * 100) / 100,
         note: "Detect-and-alert only: no CF API throttles Workers AI per-model. Mitigate in-app (drop offending model from the fallback chain).",
+      },
+      aiGateway: {
+        monitoring: true,
+        costThresholdUSD: parseFloat(env.AI_GATEWAY_COST_THRESHOLD || "5"),
+        note: "Tracks upstream-provider LLM cost (Gemini/Vertex/OpenAI) routed through AI Gateway — external spend Workers AI Neurons can't see.",
+      },
+      vectorize: {
+        monitoring: true,
+        queriedDimensionsThreshold: parseInt(env.VECTORIZE_DIMENSIONS_THRESHOLD || "500000000"),
+      },
+      totalDailySpend: {
+        thresholdUSD: parseFloat(env.TOTAL_DAILY_SPEND_THRESHOLD || "50"),
+        note: "Account-wide catch-all across CF-billable surfaces + Cloud Run — fires on cost in services without a dedicated threshold.",
+      },
+      alertDedup: {
+        enabled: !!env.ALERT_STATE,
+        cooldownHours: parseFloat(env.ALERT_COOLDOWN_HOURS || "6"),
+        note: "Edge-triggers Discord/Slack/custom so a day-long tripped threshold doesn't repeat every 5 min. PagerDuty self-dedups and always fires.",
       },
       endpoints: {
         "/": "Health check (this page)",
