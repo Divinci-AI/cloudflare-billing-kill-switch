@@ -49,6 +49,14 @@ interface Env {
   D1_ROWS_READ_THRESHOLD: string;        // Daily D1 rows read before alerting
   QUEUE_MESSAGES_THRESHOLD: string;      // Daily Queue messages before alerting
 
+  // SDK Docs monitoring thresholds
+  SDK_DOCS_COST_THRESHOLD: string;       // Daily SDK docs cost before alerting ($, default: 5)
+  SDK_DOCS_REQUEST_THRESHOLD: string;    // Daily SDK docs requests before alerting (default: 100000)
+  SDK_DOCS_ERROR_THRESHOLD: string;      // Daily SDK docs errors before alerting (default: 100)
+
+  // Workers AI (LLM inference) monitoring threshold
+  AI_NEURONS_THRESHOLD: string;          // Daily Workers AI Neurons before alerting (default: 500000 ≈ $5.50/day)
+
   // Kill switch behavior
   AUTO_DISCONNECT: string;   // "true" to auto-disconnect routes (reversible)
   AUTO_DELETE: string;       // "true" to auto-delete workers (nuclear, irreversible)
@@ -96,6 +104,20 @@ interface CloudRunServiceUsage {
   estimatedDailyCostUSD: number;
 }
 
+// Workers AI inference usage, grouped per model. Neurons is the native
+// billable unit ($0.011 / 1,000 Neurons on the standard plan), so it's
+// what we threshold on; cost is derived for human-readable alerts.
+interface AiUsage {
+  modelId: string;
+  requests: number;
+  neurons: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+// Cloudflare Workers AI pricing: $0.011 per 1,000 Neurons → $0.000011 / Neuron.
+const NEURON_COST_USD = 0.011 / 1000;
+
 interface CheckResult {
   violations: string[];
   actions: string[];
@@ -105,6 +127,7 @@ interface CheckResult {
   d1Usage: D1Usage[];
   queueUsage: QueueUsage[];
   cloudRunUsage: CloudRunServiceUsage[];
+  aiUsage: AiUsage[];
 }
 
 // ─── Cloudflare GraphQL Analytics ───────────────────────────────────────────
@@ -160,6 +183,52 @@ async function queryWorkerUsage(env: Env): Promise<WorkerUsage[]> {
     errors: g.sum.errors,
     cpuTimeMs: g.sum.wallTime / 1000,
   }));
+}
+
+// queryAiInferenceUsage — Workers AI (LLM/embedding/audio) inference usage
+// grouped per model for today, via the aiInferenceAdaptiveGroups dataset.
+// This is the cost center that drove the 2026-06-15 spike (kimi-k2.7-code:
+// 982 reqs / 3.67M Neurons / ~$40 in one day vs a <$0.35/day baseline).
+// Uses cfGraphQLSafe so a missing `ai:read` token scope degrades to [] rather
+// than blocking the other CF checks.
+async function queryAiInferenceUsage(env: Env): Promise<AiUsage[]> {
+  const today = new Date().toISOString().split("T")[0];
+  const query = `{
+    viewer {
+      accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+        aiInferenceAdaptiveGroups(
+          limit: 100,
+          filter: {date_geq: "${today}"},
+          orderBy: [sum_totalNeurons_DESC]
+        ) {
+          dimensions { modelId }
+          count
+          sum { totalNeurons totalInputTokens totalOutputTokens }
+        }
+      }
+    }
+  }`;
+
+  const data = await cfGraphQLSafe(env, query);
+  if (!data) return [];
+
+  // Collapse rows so each model is a single entry (the dataset can return one
+  // row per model already at this grouping, but sum defensively in case it
+  // splits on hidden dimensions).
+  const byModel = new Map<string, AiUsage>();
+  const groups = data?.data?.viewer?.accounts?.[0]?.aiInferenceAdaptiveGroups ?? [];
+  for (const g of groups) {
+    const modelId = g.dimensions.modelId;
+    if (!byModel.has(modelId)) {
+      byModel.set(modelId, { modelId, requests: 0, neurons: 0, inputTokens: 0, outputTokens: 0 });
+    }
+    const entry = byModel.get(modelId)!;
+    entry.requests += g.count ?? 0;
+    entry.neurons += g.sum?.totalNeurons ?? 0;
+    entry.inputTokens += g.sum?.totalInputTokens ?? 0;
+    entry.outputTokens += g.sum?.totalOutputTokens ?? 0;
+  }
+  return [...byModel.values()].sort((a, b) => b.neurons - a.neurons);
 }
 
 // cfGraphQLSafe — like cfGraphQL but returns null instead of throwing on errors.
@@ -848,6 +917,7 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   const d1RowsWrittenThreshold = parseInt(env.D1_ROWS_WRITTEN_THRESHOLD || "10000000");
   const d1RowsReadThreshold = parseInt(env.D1_ROWS_READ_THRESHOLD || "500000000");
   const queueMsgThreshold = parseInt(env.QUEUE_MESSAGES_THRESHOLD || "50000000");
+  const aiNeuronsThreshold = parseInt(env.AI_NEURONS_THRESHOLD || "500000");
 
   // Check Cloudflare usage (wrapped in try/catch so CF failures
   // don't prevent GCP checks or kill-switch.net reporting)
@@ -856,6 +926,7 @@ async function checkUsage(env: Env): Promise<CheckResult> {
   let r2Usage: R2Usage[] = [];
   let d1Usage: D1Usage[] = [];
   let queueUsage: QueueUsage[] = [];
+  let aiUsage: AiUsage[] = [];
   try {
     // Check DO usage
     console.error("[kill-switch] Checking Durable Object usage...");
@@ -942,6 +1013,28 @@ async function checkUsage(env: Env): Promise<CheckResult> {
         violations.push(`QUEUE SPIKE: ${usage.queueId} - ${totalMsgs.toLocaleString()} messages (~$${cost.toFixed(2)})`);
       }
     }
+
+    // Check Workers AI (LLM/embedding) inference — the cost center behind the
+    // 2026-06-15 spike. Thresholds on total daily Neurons across all models;
+    // names the top offenders in the alert. NOTE: this is detect-and-alert
+    // only — there is no Cloudflare API to throttle a specific model, so the
+    // mitigation is in the app (drop the offending model from the fallback
+    // chain / unbind Workers AI), not an automatic disconnect here.
+    console.error("[kill-switch] Checking Workers AI usage...");
+    aiUsage = await queryAiInferenceUsage(env);
+    const totalNeurons = aiUsage.reduce((s, a) => s + a.neurons, 0);
+    if (totalNeurons > aiNeuronsThreshold) {
+      const totalCost = totalNeurons * NEURON_COST_USD;
+      const top = aiUsage
+        .slice(0, 3)
+        .map(a => `${a.modelId} (${Math.round(a.neurons).toLocaleString()}n / $${(a.neurons * NEURON_COST_USD).toFixed(2)})`)
+        .join(", ");
+      const msg = `WORKERS AI SPIKE: ${Math.round(totalNeurons).toLocaleString()} Neurons today (~$${totalCost.toFixed(2)}) — top: ${top}`;
+      violations.push(msg);
+      console.error(`[kill-switch] ${msg}`);
+    } else {
+      console.error(`[kill-switch] Workers AI: ${Math.round(totalNeurons).toLocaleString()} Neurons (~$${(totalNeurons * NEURON_COST_USD).toFixed(2)}) - ok`);
+    }
   } catch (e) {
     console.error(`[kill-switch] Cloudflare check failed (GCP checks unaffected): ${e}`);
     violations.push(`CF MONITORING ERROR: ${e}`);
@@ -984,6 +1077,36 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     violations.push(`GCP MONITORING ERROR: ${e}`);
   }
 
+  // ── SDK Docs Specific Monitoring ─────────────────────────────────
+  // Check SDK docs workers against dedicated thresholds (cost, traffic,
+  // error rate). These are granular alerts complementing the general
+  // WORKER_REQUEST_THRESHOLD — SDK docs has its own budget because it's
+  // a static-asset site with predictable traffic patterns.
+  const sdkDocsCostThreshold = parseFloat(env.SDK_DOCS_COST_THRESHOLD || "5");
+  const sdkDocsReqThreshold = parseInt(env.SDK_DOCS_REQUEST_THRESHOLD || "100000");
+  const sdkDocsErrThreshold = parseInt(env.SDK_DOCS_ERROR_THRESHOLD || "100");
+
+  const sdkDocsWorkers = workerUsage.filter(w =>
+    w.scriptName.includes("divinci-sdk-docs")
+  );
+
+  for (const w of sdkDocsWorkers) {
+    const dailyCost = Math.round(w.requests * 0.0000003 * 100) / 100;
+    const reasons: string[] = [];
+
+    if (dailyCost > sdkDocsCostThreshold) reasons.push(`$${dailyCost.toFixed(2)} cost`);
+    if (w.requests > sdkDocsReqThreshold) reasons.push(`${w.requests.toLocaleString()} reqs`);
+    if (w.errors > sdkDocsErrThreshold) reasons.push(`${w.errors} errors`);
+
+    if (reasons.length > 0) {
+      const msg = `SDK DOCS ALERT: ${w.scriptName} - ${reasons.join(", ")}`;
+      violations.push(msg);
+      console.error(`[kill-switch] ${msg}`);
+    } else {
+      console.error(`[kill-switch] ${w.scriptName}: $${dailyCost.toFixed(2)} cost, ${w.requests.toLocaleString()} reqs - ok`);
+    }
+  }
+
   // Send alerts if any violations
   if (violations.length > 0) {
     const providers = new Set<string>();
@@ -1010,7 +1133,7 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     console.error("[kill-switch] All usage within thresholds.");
   }
 
-  const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage };
+  const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage, aiUsage };
 
   // Report to kill-switch.net
   await reportToKillSwitch(env, result);
@@ -1086,6 +1209,156 @@ export default {
       return Response.json({ status: "test alert sent" });
     }
 
+    if (url.pathname === "/spend") {
+      const protectedWorkers = (env.PROTECTED_WORKERS || "").split(",").map(s => s.trim()).filter(Boolean);
+
+      let doUsage: DOUsage[] = [];
+      let workerUsage: WorkerUsage[] = [];
+      let r2Usage: R2Usage[] = [];
+      let d1Usage: D1Usage[] = [];
+      let queueUsage: QueueUsage[] = [];
+      let cloudRunUsage: CloudRunServiceUsage[] = [];
+      let aiUsage: AiUsage[] = [];
+      const errors: string[] = [];
+
+      try { doUsage = await queryDOUsage(env); } catch (e) { errors.push(`do:${e}`); }
+      try { workerUsage = await queryWorkerUsage(env); } catch (e) { errors.push(`workers:${e}`); }
+      try { r2Usage = await queryR2Usage(env); } catch (e) { errors.push(`r2:${e}`); }
+      try { d1Usage = await queryD1Usage(env); } catch (e) { errors.push(`d1:${e}`); }
+      try { queueUsage = await queryQueueUsage(env); } catch (e) { errors.push(`queues:${e}`); }
+      try { cloudRunUsage = await queryCloudRunUsage(env); } catch (e) { errors.push(`cloudrun:${e}`); }
+      try { aiUsage = await queryAiInferenceUsage(env); } catch (e) { errors.push(`ai:${e}`); }
+
+      const doCosts = doUsage.map(d => ({
+        scriptName: d.scriptName,
+        requests: d.requests,
+        wallTimeHours: d.wallTimeHours,
+        estimatedDailyCostUSD: Math.round(
+          (d.requests * 0.00000015) +       // DO reqs: $0.15/million
+          (d.wallTimeHours * 12.50 / 1000)  // DO duration: $12.50/million GB-s (~1GB per DO)
+        * 100) / 100,
+        protected: protectedWorkers.includes(d.scriptName),
+      }));
+
+      const workerCosts = workerUsage.map(w => ({
+        scriptName: w.scriptName,
+        requests: w.requests,
+        errors: w.errors,
+        cpuTimeMs: w.cpuTimeMs,
+        estimatedDailyCostUSD: Math.round(w.requests * 0.0000003 * 100) / 100,  // $0.30/million
+        protected: protectedWorkers.includes(w.scriptName),
+      }));
+
+      const cloudRunCosts = cloudRunUsage.map(cr => ({
+        serviceName: cr.serviceName,
+        requests: cr.requests,
+        activeInstances: cr.activeInstances,
+        estimatedDailyCostUSD: cr.estimatedDailyCostUSD,
+      }));
+
+      const r2Costs = r2Usage.map(r => ({
+        bucketName: r.bucketName,
+        classAOps: r.classAOps,
+        classBOps: r.classBOps,
+        storageGB: r.storageGB,
+        estimatedDailyCostUSD: Math.round(
+          (r.classAOps * 4.50 / 1e6) +    // Class A: $4.50/million
+          (r.classBOps * 0.36 / 1e6)       // Class B: $0.36/million
+        * 100) / 100,
+      }));
+
+      const aiCosts = aiUsage.map(a => ({
+        modelId: a.modelId,
+        requests: a.requests,
+        neurons: Math.round(a.neurons),
+        inputTokens: Math.round(a.inputTokens),
+        outputTokens: Math.round(a.outputTokens),
+        estimatedDailyCostUSD: Math.round(a.neurons * NEURON_COST_USD * 100) / 100,
+      }));
+
+      const totalDOSpend = doCosts.reduce((s, d) => s + d.estimatedDailyCostUSD, 0);
+      const totalWorkerSpend = workerCosts.reduce((s, w) => s + w.estimatedDailyCostUSD, 0);
+      const totalCloudRunSpend = cloudRunCosts.reduce((s, cr) => s + cr.estimatedDailyCostUSD, 0);
+      const totalR2Spend = r2Costs.reduce((s, r) => s + r.estimatedDailyCostUSD, 0);
+      const totalAiSpend = Math.round(aiUsage.reduce((s, a) => s + a.neurons, 0) * NEURON_COST_USD * 100) / 100;
+      const totalDailySpend = Math.round((totalDOSpend + totalWorkerSpend + totalCloudRunSpend + totalR2Spend + totalAiSpend) * 100) / 100;
+
+      const sdkDocsWorkers = workerCosts.filter(w =>
+        w.scriptName.includes("divinci-sdk-docs")
+      );
+      const sdkDocsEstimatedDaily = sdkDocsWorkers.reduce((s, w) => s + w.estimatedDailyCostUSD, 0);
+
+      return Response.json({
+        estimatedDailyCostUSD: {
+          total: totalDailySpend,
+          byProvider: {
+            cloudflare: {
+              durableObjects: totalDOSpend,
+              workers: totalWorkerSpend,
+              r2: totalR2Spend,
+              workersAI: totalAiSpend,
+            },
+            gcp: {
+              cloudRun: totalCloudRunSpend,
+            },
+          },
+        },
+        services: {
+          durableObjects: doCosts,
+          workers: workerCosts,
+          r2: r2Costs,
+          d1: d1Usage.map(d => ({
+            databaseId: d.databaseId,
+            rowsRead: d.rowsRead,
+            rowsWritten: d.rowsWritten,
+            estimatedDailyCostUSD: Math.round(d.rowsWritten * 1.00 / 1e6 * 100) / 100,
+          })),
+          queues: queueUsage.map(q => ({
+            queueId: q.queueId,
+            messagesProduced: q.messagesProduced,
+            messagesConsumed: q.messagesConsumed,
+            estimatedDailyCostUSD: Math.round((q.messagesProduced + q.messagesConsumed) * 0.40 / 1e6 * 100) / 100,
+          })),
+          cloudRun: cloudRunCosts,
+          workersAI: aiCosts,
+        },
+        workersAI: {
+          models: aiCosts,
+          totalNeurons: Math.round(aiUsage.reduce((s, a) => s + a.neurons, 0)),
+          estimatedDailyCostUSD: totalAiSpend,
+          neuronCostUSD: NEURON_COST_USD,
+          threshold: {
+            neurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+            approxUSD: Math.round(parseInt(env.AI_NEURONS_THRESHOLD || "500000") * NEURON_COST_USD * 100) / 100,
+          },
+        },
+        sdkDocs: {
+          workers: sdkDocsWorkers,
+          estimatedDailyCostUSD: sdkDocsEstimatedDaily,
+          protected: protectedWorkers.some(w => w.includes("divinci-sdk-docs")),
+          thresholds: {
+            cost: parseFloat(env.SDK_DOCS_COST_THRESHOLD || "5"),
+            requests: parseInt(env.SDK_DOCS_REQUEST_THRESHOLD || "100000"),
+            errors: parseInt(env.SDK_DOCS_ERROR_THRESHOLD || "100"),
+          },
+        },
+        thresholds: {
+          doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
+          doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
+          workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
+          r2Ops: parseInt(env.R2_OPS_THRESHOLD || "50000000"),
+          cloudRunRequests: parseInt(env.CLOUD_RUN_REQUEST_THRESHOLD || "5000000"),
+          cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "100"),
+          cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "8000"),
+          aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+        },
+        errors: errors.length > 0 ? errors : undefined,
+        autoDisconnect: env.AUTO_DISCONNECT === "true",
+        autoDelete: env.AUTO_DELETE === "true",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     // Usage report (no alerts, just data)
     if (url.pathname === "/usage") {
       const doUsage = await queryDOUsage(env);
@@ -1094,6 +1367,7 @@ export default {
       const d1Usage = await queryD1Usage(env);
       const queueUsage = await queryQueueUsage(env);
       const cloudRunUsage = await queryCloudRunUsage(env);
+      const aiUsage = await queryAiInferenceUsage(env);
       return Response.json({
         doUsage,
         workerUsage: workerUsage.slice(0, 20), // top 20 by requests
@@ -1101,6 +1375,7 @@ export default {
         d1Usage,
         queueUsage,
         cloudRunUsage,
+        aiUsage,
         thresholds: {
           doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
           doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
@@ -1112,6 +1387,7 @@ export default {
           cloudRunRequests: parseInt(env.CLOUD_RUN_REQUEST_THRESHOLD || "5000000"),
           cloudRunInstances: parseInt(env.CLOUD_RUN_INSTANCE_THRESHOLD || "100"),
           cloudRunMonthlyCost: parseFloat(env.CLOUD_RUN_MONTHLY_COST_THRESHOLD || "8000"),
+          aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
         },
         killSwitchNet: {
           connected: !!env.KILL_SWITCH_AGENT_API_KEY,
@@ -1133,6 +1409,7 @@ export default {
             doRequests: parseInt(env.DO_REQUEST_THRESHOLD || "1000000"),
             doWalltimeHours: parseFloat(env.DO_WALLTIME_HOURS_THRESHOLD || "100"),
             workerRequests: parseInt(env.WORKER_REQUEST_THRESHOLD || "10000000"),
+            aiNeurons: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
           },
         },
         gcp: {
@@ -1159,9 +1436,23 @@ export default {
         slack: !!env.SLACK_WEBHOOK_URL,
         customWebhook: !!env.CUSTOM_WEBHOOK_URL,
       },
+      sdkDocs: {
+        monitoring: true,
+        costThreshold: parseFloat(env.SDK_DOCS_COST_THRESHOLD || "5"),
+        requestThreshold: parseInt(env.SDK_DOCS_REQUEST_THRESHOLD || "100000"),
+        errorThreshold: parseInt(env.SDK_DOCS_ERROR_THRESHOLD || "100"),
+        protectedWorkers: (env.PROTECTED_WORKERS || "").split(",").filter(w => w.includes("divinci-sdk-docs")),
+      },
+      workersAI: {
+        monitoring: true,
+        neuronThreshold: parseInt(env.AI_NEURONS_THRESHOLD || "500000"),
+        approxCostThresholdUSD: Math.round(parseInt(env.AI_NEURONS_THRESHOLD || "500000") * NEURON_COST_USD * 100) / 100,
+        note: "Detect-and-alert only: no CF API throttles Workers AI per-model. Mitigate in-app (drop offending model from the fallback chain).",
+      },
       endpoints: {
         "/": "Health check (this page)",
         "/check": "Run usage check now (triggers alerts if thresholds exceeded)",
+        "/spend": "Estimated daily cost breakdown by service/provider (no alerts)",
         "/usage": "View current usage data (no alerts)",
         "/test-alert": "Send a test alert to all configured destinations",
       },

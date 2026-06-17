@@ -56,6 +56,34 @@ D1_ROWS_READ_THRESHOLD = "10000000000"
 # Context: $0.40/million messages
 QUEUE_MESSAGES_THRESHOLD = "50000000"
 
+# ── SDK Docs Monitoring Thresholds ───────────────────────────────────────────
+# Granular alerts for sdk.divinci.ai documentation site traffic and costs.
+# SDK docs is a static-asset Worker (Astro/Starlight) with predictable traffic
+# patterns. These thresholds complement the general WORKER_REQUEST_THRESHOLD.
+
+# SDK docs daily estimated cost before alerting (default: $5/day)
+SDK_DOCS_COST_THRESHOLD = "5"
+
+# SDK docs daily request count before alerting (default: 100,000 requests)
+# Context: A 10x spike would be ~100k requests; normal baseline is ~5-10k/day
+SDK_DOCS_REQUEST_THRESHOLD = "100000"
+
+# SDK docs daily error count before alerting (default: 100 errors)
+# Context: A small percentage of requests may error due to cache misses / CF edge
+# issues. 100+ errors/day suggests a deploy regression or upstream API problem.
+SDK_DOCS_ERROR_THRESHOLD = "100"
+
+# ── Workers AI (LLM inference) Threshold ─────────────────────────────────────
+# Daily total Workers AI Neurons (across ALL models) before alerting.
+# Neurons are the billable unit: $0.011 / 1,000 Neurons (~$0.000011 each).
+# Baseline is <30k Neurons/day (~$0.30). The 2026-06-15 incident was 3.67M
+# Neurons (~$40) in a single day, almost all @cf/moonshotai/kimi-k2.7-code
+# (the fallback-chain tool-loop model). 500,000 Neurons ≈ $5.50/day catches a
+# ~15x spike well before it compounds, without firing on embedding-heavy days.
+# NOTE: alert-only — there is no CF API to throttle Workers AI per-model;
+# mitigate in-app by dropping the offending model from the fallback chain.
+AI_NEURONS_THRESHOLD = "500000"
+
 # ── GCP Cloud Run Thresholds ────────────────────────────────────────────────
 # Monitors Cloud Run services (public-api, public-api-live, webhook, open-parse).
 # GCP_SERVICE_ACCOUNT_JSON, GCP_PROJECT_ID → set via `wrangler secret put`
@@ -91,7 +119,7 @@ AUTO_DELETE = "false"
 # Workers that should NEVER be killed, even if they exceed thresholds.
 # Comma-separated list of worker script names.
 # Always include this kill switch worker itself!
-PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-agent-production"
+PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-agent-production,divinci-sdk-docs,divinci-sdk-docs-staging"
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
 # Set these via `wrangler secret put <NAME>`
