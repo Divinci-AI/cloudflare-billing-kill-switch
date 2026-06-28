@@ -17,6 +17,15 @@ crons = ["*/5 * * * *"]
 binding = "ALERT_STATE"
 id = "70af5e6edb8b414ab96f6bbb0618b4be"
 
+# PagerDuty Events API v2 routing key, sourced from the account Secrets Store.
+# Declared here so `wrangler deploy` preserves the binding — it was previously
+# attached out-of-band (dashboard/API) and an undeclared deploy would DROP it,
+# silently disarming PagerDuty alerting. (Audited 2026-06-27.)
+[[secrets_store_secrets]]
+binding = "PAGERDUTY_ROUTING_KEY"
+store_id = "0b7ac993cf26413ea6e2f1b5ede20b25"
+secret_name = "PAGERDUTY_ROUTING_KEY"
+
 [vars]
 ENVIRONMENT = "production"
 
