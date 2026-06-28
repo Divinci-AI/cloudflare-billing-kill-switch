@@ -1453,12 +1453,30 @@ export default {
     // alert policies notify Slack without GCP's native (OAuth-only) Slack channel,
     // reusing the SLACK_WEBHOOK_URL this worker already binds. (Added 2026-06-28.)
     if (url.pathname === "/gcp-alert") {
-      const gcpToken = (env as any).GCP_ALERT_TOKEN;
-      if (!gcpToken || url.searchParams.get("token") !== gcpToken) {
-        return Response.json({ error: "Unauthorized" }, { status: 401 });
-      }
+      const gcpToken = (env as any).GCP_ALERT_TOKEN as string | undefined;
       if (request.method !== "POST") {
         return Response.json({ error: "Method not allowed" }, { status: 405 });
+      }
+      // Prefer the token in the Authorization header (Basic or Bearer) so it does
+      // NOT travel in the URL/query (which lands in edge/access logs + channel
+      // config). Fall back to ?token= for compatibility. Compared in constant time.
+      const authz = request.headers.get("Authorization") || "";
+      let provided = "";
+      if (authz.startsWith("Basic ")) {
+        try { const dec = atob(authz.slice(6)); provided = dec.includes(":") ? dec.slice(dec.indexOf(":") + 1) : dec; } catch { /* malformed */ }
+      } else if (authz.startsWith("Bearer ")) {
+        provided = authz.slice(7);
+      } else {
+        provided = url.searchParams.get("token") || "";
+      }
+      const tokenOk = (() => {
+        if (!gcpToken || provided.length !== gcpToken.length) return false;
+        let mismatch = 0;
+        for (let i = 0; i < gcpToken.length; i++) mismatch |= provided.charCodeAt(i) ^ gcpToken.charCodeAt(i);
+        return mismatch === 0;
+      })();
+      if (!tokenOk) {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
       }
       let payload: any = {};
       try { payload = await request.json(); } catch { /* tolerate non-JSON */ }
@@ -1466,10 +1484,20 @@ export default {
       const resolved = inc.state === "closed";
       const emoji = resolved ? ":white_check_mark:" : ":rotating_light:";
       const stateLabel = resolved ? "RESOLVED" : "FIRING";
-      const title = inc.policy_name || inc.condition_name || "GCP Monitoring alert";
-      const summary = inc.summary || "(no summary provided)";
-      const link = inc.url || "";
-      const text = `${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${link ? `\n<${link}|View incident>` : ""}`;
+      // Escape Slack mrkdwn control chars (& < >) in alert-sourced text so a
+      // crafted payload can't inject markup / fake links / @here mentions.
+      const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 1000);
+      const title = esc(inc.policy_name || inc.condition_name || "GCP Monitoring alert");
+      const summary = esc(inc.summary || "(no summary provided)");
+      // Only render a link if it's a real https Google Cloud URL; otherwise drop it.
+      let linkSuffix = "";
+      try {
+        const u = new URL(String(inc.url || ""));
+        if (u.protocol === "https:" && /(^|\.)(google\.com|googleapis\.com)$/.test(u.hostname)) {
+          linkSuffix = `\n<${u.toString()}|View incident>`;
+        }
+      } catch { /* no/invalid url → no link */ }
+      const text = `${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${linkSuffix}`;
       if (env.SLACK_WEBHOOK_URL) {
         const res = await fetch(env.SLACK_WEBHOOK_URL, {
           method: "POST",
@@ -1477,7 +1505,7 @@ export default {
           body: JSON.stringify({ text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }),
         });
         if (!res.ok) {
-          console.error(`[gcp-relay] Slack post failed: ${res.status} ${await res.text()}`);
+          console.error(`[gcp-relay] Slack post failed: ${res.status}`);
           return Response.json({ error: "slack post failed" }, { status: 502 });
         }
       }
