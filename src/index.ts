@@ -1448,6 +1448,42 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // GCP Monitoring → Slack relay. Token-gated via ?token=, isolated to Slack
+    // forwarding only — it cannot reach checkUsage/kill-switch logic. Lets GCP
+    // alert policies notify Slack without GCP's native (OAuth-only) Slack channel,
+    // reusing the SLACK_WEBHOOK_URL this worker already binds. (Added 2026-06-28.)
+    if (url.pathname === "/gcp-alert") {
+      const gcpToken = (env as any).GCP_ALERT_TOKEN;
+      if (!gcpToken || url.searchParams.get("token") !== gcpToken) {
+        return Response.json({ error: "Unauthorized" }, { status: 401 });
+      }
+      if (request.method !== "POST") {
+        return Response.json({ error: "Method not allowed" }, { status: 405 });
+      }
+      let payload: any = {};
+      try { payload = await request.json(); } catch { /* tolerate non-JSON */ }
+      const inc = payload?.incident ?? {};
+      const resolved = inc.state === "closed";
+      const emoji = resolved ? ":white_check_mark:" : ":rotating_light:";
+      const stateLabel = resolved ? "RESOLVED" : "FIRING";
+      const title = inc.policy_name || inc.condition_name || "GCP Monitoring alert";
+      const summary = inc.summary || "(no summary provided)";
+      const link = inc.url || "";
+      const text = `${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${link ? `\n<${link}|View incident>` : ""}`;
+      if (env.SLACK_WEBHOOK_URL) {
+        const res = await fetch(env.SLACK_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }),
+        });
+        if (!res.ok) {
+          console.error(`[gcp-relay] Slack post failed: ${res.status} ${await res.text()}`);
+          return Response.json({ error: "slack post failed" }, { status: 502 });
+        }
+      }
+      return Response.json({ status: "relayed", state: resolved ? "resolved" : "firing" });
+    }
+
     // Auth: require ADMIN_SECRET for all non-health endpoints
     const adminSecret = (env as any).ADMIN_SECRET;
     if (adminSecret && url.pathname !== "/") {
