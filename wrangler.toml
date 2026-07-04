@@ -177,7 +177,8 @@ DISCONNECT_THRESHOLD_MULTIPLIER = "10"
 # Workers that should NEVER be killed, even if they exceed thresholds.
 # Comma-separated list of worker script names.
 # Always include this kill switch worker itself!
-PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-agent-production,divinci-sdk-docs,divinci-sdk-docs-staging"
+# Also doubles as the protected list for GCP Cloud Run auto-disconnect (index.ts).
+PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-agent-production,divinci-sdk-docs,divinci-sdk-docs-staging,divinci-production-server-api,divinci-production-server-api-live,divinci-production-api-webhook,divinci-staging-server-api,divinci-staging-server-api-live"
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
 # Set these via `wrangler secret put <NAME>`

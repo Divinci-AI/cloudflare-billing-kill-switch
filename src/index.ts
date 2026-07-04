@@ -1297,8 +1297,15 @@ async function checkUsage(env: Env): Promise<CheckResult> {
 
         // Cloud Run auto-disconnect: set min/max instances to 0 via Cloud Run Admin API
         // This is less destructive than deleting — just stops new instances from spinning up
+        // Never auto-disconnect protected Cloud Run services (prod API/live/webhook).
+        // PROTECTED_WORKERS doubles as the protected list for Cloud Run names here;
+        // the GCP-side kill switch has its own PROTECTED_SERVICES.
+        const protectedCloudRun = (env.PROTECTED_WORKERS || "").split(",").map(s=>s.trim()).filter(Boolean);
         if (!runaway) {
           console.error(`[kill-switch] ${usage.serviceName}: over alert threshold but below ${disconnectMultiplier}× kill threshold — alert only`);
+        } else if (protectedCloudRun.includes(usage.serviceName)) {
+          actions.push(`PROTECTED: ${usage.serviceName} exceeded ${disconnectMultiplier}× kill threshold but is protected — alert only`);
+          console.error(`[kill-switch] ${usage.serviceName}: runaway but PROTECTED — not disconnecting`);
         } else if (autoDisconnect && env.GCP_SERVICE_ACCOUNT_JSON && env.GCP_PROJECT_ID) {
           const action = await disableCloudRunService(env, usage.serviceName);
           actions.push(action);
