@@ -984,11 +984,20 @@ async function alertPagerDuty(
 ): Promise<void> {
   const dedup = `cf-billing-${new Date().toISOString().split("T")[0]}${dedupSuffix ? `-${dedupSuffix}` : ""}`;
 
+  // PAGERDUTY_ROUTING_KEY is a Secrets Store binding (object with async .get()),
+  // NOT a plain string — serializing it directly sends a malformed routing_key
+  // and PagerDuty silently 400s. Resolve to the actual string first.
+  const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
+  if (!routingKey) {
+    console.error("[kill-switch] PagerDuty skipped: PAGERDUTY_ROUTING_KEY unavailable");
+    return;
+  }
+
   const res = await fetch("https://events.pagerduty.com/v2/enqueue", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      routing_key: env.PAGERDUTY_ROUTING_KEY,
+      routing_key: routingKey,
       event_action: "trigger",
       dedup_key: dedup,
       payload: {
