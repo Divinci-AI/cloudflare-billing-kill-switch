@@ -961,6 +961,20 @@ async function sendAlerts(
   await Promise.allSettled(promises);
 }
 
+// Resolve a secret binding to its string value. Handles BOTH shapes:
+// a plain string (secret_text / var) and a Cloudflare Secrets Store binding
+// (object exposing async .get()). PAGERDUTY_ROUTING_KEY is declared as a
+// [[secrets_store_secrets]] binding in wrangler.toml, so it arrives as an
+// object here — reading it as a bare string would serialize "[object Object]".
+async function resolveSecret(v: unknown): Promise<string> {
+  if (!v) return "";
+  if (typeof v === "string") return v;
+  if (typeof (v as { get?: unknown }).get === "function") {
+    try { return String(await (v as { get: () => Promise<string> }).get() ?? ""); } catch { return ""; }
+  }
+  return String(v);
+}
+
 async function alertPagerDuty(
   env: Env,
   summary: string,
@@ -1459,8 +1473,12 @@ export default {
     // forwarding only — it cannot reach checkUsage/kill-switch logic. Lets GCP
     // alert policies notify Slack without GCP's native (OAuth-only) Slack channel,
     // reusing the SLACK_WEBHOOK_URL this worker already binds. (Added 2026-06-28.)
-    if (url.pathname === "/gcp-alert") {
-      const gcpToken = (env as any).GCP_ALERT_TOKEN as string | undefined;
+    if (url.pathname === "/gcp-alert" || url.pathname === "/gcp-page") {
+      // /gcp-alert → Slack only (existing GCP_ALERT_TOKEN, untouched).
+      // /gcp-page  → Slack + clean PagerDuty page (separate GCP_PAGE_TOKEN so
+      //   crit policies can page without rotating the Slack-relay token).
+      const wantPd = url.pathname === "/gcp-page";
+      const gcpToken = (wantPd ? (env as any).GCP_PAGE_TOKEN : (env as any).GCP_ALERT_TOKEN) as string | undefined;
       if (request.method !== "POST") {
         return Response.json({ error: "Method not allowed" }, { status: 405 });
       }
@@ -1516,7 +1534,60 @@ export default {
           return Response.json({ error: "slack post failed" }, { status: 502 });
         }
       }
-      return Response.json({ status: "relayed", state: resolved ? "resolved" : "firing" });
+      // Optional PagerDuty paging. CRIT-tier GCP policies point here with ?pd=1
+      // so on-call gets a CLEAN incident title — GCP's native PD channel dumps
+      // the raw condition text ("An uptime check on openai-api-... labels {..}").
+      // We build the title from the policy's documentation.subject (GCP ships it
+      // in the webhook), strip GCP's "[ALERT - ...] " prefix, and dedup by the
+      // GCP incident_id so open→trigger / closed→resolve collapse to one incident.
+      let pdStatus: string | undefined;
+      if (wantPd) {
+        const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
+        if (!routingKey) {
+          console.error("[gcp-relay] pd=1 requested but PAGERDUTY_ROUTING_KEY unavailable");
+          pdStatus = "no_routing_key";
+        } else {
+          const rawSubject = String(inc.documentation?.subject ?? "");
+          const cleanSubject = rawSubject.replace(/^\[[^\]]*\]\s*/, "").trim();
+          const pdSummary = (cleanSubject || String(inc.policy_name || inc.condition_name || "GCP prod alert")).slice(0, 1024);
+          const dedupKey = `gcp-${String(inc.incident_id || inc.condition_name || pdSummary)}`.slice(0, 255);
+          // 🔴 (red circle) subjects are page-worthy criticals; 🟠 are warnings.
+          const sev: "critical" | "warning" = rawSubject.includes("🔴") ? "critical" : "warning";
+          const pdRes = await fetch("https://events.pagerduty.com/v2/enqueue", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              routing_key: routingKey,
+              event_action: resolved ? "resolve" : "trigger",
+              dedup_key: dedupKey,
+              payload: {
+                summary: pdSummary,
+                source: String(inc.resource_name || inc.policy_name || "gcp-monitoring").slice(0, 255),
+                severity: sev,
+                component: "gcp-cloud-run",
+                group: env.ENVIRONMENT || "production",
+                class: "prod-health",
+                custom_details: {
+                  policy_name: inc.policy_name,
+                  condition_name: inc.condition_name,
+                  state: inc.state,
+                  documentation: inc.documentation?.content,
+                  console_url: inc.url,
+                },
+              },
+              client: "GCP Monitoring (via billing-monitor relay)",
+              client_url: typeof inc.url === "string" ? inc.url : undefined,
+            }),
+          });
+          if (!pdRes.ok) {
+            console.error(`[gcp-relay] PagerDuty enqueue failed: ${pdRes.status}`);
+            pdStatus = `error_${pdRes.status}`;
+          } else {
+            pdStatus = resolved ? "resolved" : "triggered";
+          }
+        }
+      }
+      return Response.json({ status: "relayed", state: resolved ? "resolved" : "firing", pd: pdStatus });
     }
 
     // Auth: require ADMIN_SECRET for all non-health endpoints
