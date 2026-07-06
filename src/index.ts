@@ -66,6 +66,25 @@ interface Env {
   ALERT_COOLDOWN_HOURS: string;          // Suppress repeat webhook alerts for the same violation set (default: 6)
   ALERT_STATE?: KVNamespace;             // Optional KV binding for alert de-dup state (no-op if unbound)
 
+  // ── MongoDB Atlas pause detection ──────────────────────────────────────────
+  // When a cluster is *deliberately* paused (overnight cost-control, migration),
+  // DB-backed routes 503 and the GCP 5xx alert would false-page. The cron polls
+  // Atlas pause-state and sets a KV flag the relay reads to suppress DB-symptom
+  // pages (never uptime). Programmatic API key → HTTP Digest auth.
+  ATLAS_PROD_PUBLIC_KEY?: string;
+  ATLAS_PROD_PRIVATE_KEY?: string;
+  ATLAS_PROD_PROJECT_ID?: string;
+  ATLAS_PROD_CLUSTER?: string;
+  ATLAS_STAGING_PUBLIC_KEY?: string;
+  ATLAS_STAGING_PRIVATE_KEY?: string;
+  ATLAS_STAGING_PROJECT_ID?: string;
+  ATLAS_STAGING_CLUSTER?: string;
+  // Datadog — to mute DB-symptom monitors (e.g. CF 5xx) via downtime while paused.
+  DD_API_KEY?: string;
+  DD_APP_KEY?: string;
+  DD_SITE?: string;                        // default: us5.datadoghq.com
+  DD_DB_SYMPTOM_MONITOR_IDS?: string;      // comma-sep DD monitor ids to mute while prod paused
+
   // Kill switch behavior
   AUTO_DISCONNECT: string;   // "true" to auto-disconnect routes (reversible)
   AUTO_DELETE: string;       // "true" to auto-delete workers (nuclear, irreversible)
@@ -975,6 +994,147 @@ async function resolveSecret(v: unknown): Promise<string> {
   return String(v);
 }
 
+// Compact MD5 (RFC 1321, blueimp core) — needed for Atlas Digest auth. Web
+// Crypto has no MD5; inlined to avoid a node:crypto/runtime-compat dependency.
+// ASCII/Latin1 input (Atlas keys + nonces are ASCII).
+function md5hex(s: string): string {
+  const safeAdd = (x: number, y: number) => { const l = (x & 0xffff) + (y & 0xffff); return (((x >> 16) + (y >> 16) + (l >> 16)) << 16) | (l & 0xffff); };
+  const rol = (n: number, c: number) => (n << c) | (n >>> (32 - c));
+  const cmn = (q: number, a: number, b: number, x: number, s: number, t: number) => safeAdd(rol(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b);
+  const ff = (a: number, b: number, c: number, d: number, x: number, s: number, t: number) => cmn((b & c) | (~b & d), a, b, x, s, t);
+  const gg = (a: number, b: number, c: number, d: number, x: number, s: number, t: number) => cmn((b & d) | (c & ~d), a, b, x, s, t);
+  const hh = (a: number, b: number, c: number, d: number, x: number, s: number, t: number) => cmn(b ^ c ^ d, a, b, x, s, t);
+  const ii = (a: number, b: number, c: number, d: number, x: number, s: number, t: number) => cmn(c ^ (b | ~d), a, b, x, s, t);
+  const bin: number[] = [];
+  for (let i = 0; i < s.length * 8; i += 8) bin[i >> 5] |= (s.charCodeAt(i / 8) & 0xff) << (i % 32);
+  const len = s.length * 8;
+  bin[len >> 5] |= 0x80 << (len % 32);
+  bin[(((len + 64) >>> 9) << 4) + 14] = len;
+  let a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+  for (let i = 0; i < bin.length; i += 16) {
+    const oa = a, ob = b, oc = c, od = d;
+    a = ff(a, b, c, d, bin[i] | 0, 7, -680876936); d = ff(d, a, b, c, bin[i + 1] | 0, 12, -389564586); c = ff(c, d, a, b, bin[i + 2] | 0, 17, 606105819); b = ff(b, c, d, a, bin[i + 3] | 0, 22, -1044525330);
+    a = ff(a, b, c, d, bin[i + 4] | 0, 7, -176418897); d = ff(d, a, b, c, bin[i + 5] | 0, 12, 1200080426); c = ff(c, d, a, b, bin[i + 6] | 0, 17, -1473231341); b = ff(b, c, d, a, bin[i + 7] | 0, 22, -45705983);
+    a = ff(a, b, c, d, bin[i + 8] | 0, 7, 1770035416); d = ff(d, a, b, c, bin[i + 9] | 0, 12, -1958414417); c = ff(c, d, a, b, bin[i + 10] | 0, 17, -42063); b = ff(b, c, d, a, bin[i + 11] | 0, 22, -1990404162);
+    a = ff(a, b, c, d, bin[i + 12] | 0, 7, 1804603682); d = ff(d, a, b, c, bin[i + 13] | 0, 12, -40341101); c = ff(c, d, a, b, bin[i + 14] | 0, 17, -1502002290); b = ff(b, c, d, a, bin[i + 15] | 0, 22, 1236535329);
+    a = gg(a, b, c, d, bin[i + 1] | 0, 5, -165796510); d = gg(d, a, b, c, bin[i + 6] | 0, 9, -1069501632); c = gg(c, d, a, b, bin[i + 11] | 0, 14, 643717713); b = gg(b, c, d, a, bin[i] | 0, 20, -373897302);
+    a = gg(a, b, c, d, bin[i + 5] | 0, 5, -701558691); d = gg(d, a, b, c, bin[i + 10] | 0, 9, 38016083); c = gg(c, d, a, b, bin[i + 15] | 0, 14, -660478335); b = gg(b, c, d, a, bin[i + 4] | 0, 20, -405537848);
+    a = gg(a, b, c, d, bin[i + 9] | 0, 5, 568446438); d = gg(d, a, b, c, bin[i + 14] | 0, 9, -1019803690); c = gg(c, d, a, b, bin[i + 3] | 0, 14, -187363961); b = gg(b, c, d, a, bin[i + 8] | 0, 20, 1163531501);
+    a = gg(a, b, c, d, bin[i + 13] | 0, 5, -1444681467); d = gg(d, a, b, c, bin[i + 2] | 0, 9, -51403784); c = gg(c, d, a, b, bin[i + 7] | 0, 14, 1735328473); b = gg(b, c, d, a, bin[i + 12] | 0, 20, -1926607734);
+    a = hh(a, b, c, d, bin[i + 5] | 0, 4, -378558); d = hh(d, a, b, c, bin[i + 8] | 0, 11, -2022574463); c = hh(c, d, a, b, bin[i + 11] | 0, 16, 1839030562); b = hh(b, c, d, a, bin[i + 14] | 0, 23, -35309556);
+    a = hh(a, b, c, d, bin[i + 1] | 0, 4, -1530992060); d = hh(d, a, b, c, bin[i + 4] | 0, 11, 1272893353); c = hh(c, d, a, b, bin[i + 7] | 0, 16, -155497632); b = hh(b, c, d, a, bin[i + 10] | 0, 23, -1094730640);
+    a = hh(a, b, c, d, bin[i + 13] | 0, 4, 681279174); d = hh(d, a, b, c, bin[i] | 0, 11, -358537222); c = hh(c, d, a, b, bin[i + 3] | 0, 16, -722521979); b = hh(b, c, d, a, bin[i + 6] | 0, 23, 76029189);
+    a = hh(a, b, c, d, bin[i + 9] | 0, 4, -640364487); d = hh(d, a, b, c, bin[i + 12] | 0, 11, -421815835); c = hh(c, d, a, b, bin[i + 15] | 0, 16, 530742520); b = hh(b, c, d, a, bin[i + 2] | 0, 23, -995338651);
+    a = ii(a, b, c, d, bin[i] | 0, 6, -198630844); d = ii(d, a, b, c, bin[i + 7] | 0, 10, 1126891415); c = ii(c, d, a, b, bin[i + 14] | 0, 15, -1416354905); b = ii(b, c, d, a, bin[i + 5] | 0, 21, -57434055);
+    a = ii(a, b, c, d, bin[i + 12] | 0, 6, 1700485571); d = ii(d, a, b, c, bin[i + 3] | 0, 10, -1894986606); c = ii(c, d, a, b, bin[i + 10] | 0, 15, -1051523); b = ii(b, c, d, a, bin[i + 1] | 0, 21, -2054922799);
+    a = ii(a, b, c, d, bin[i + 8] | 0, 6, 1873313359); d = ii(d, a, b, c, bin[i + 15] | 0, 10, -30611744); c = ii(c, d, a, b, bin[i + 6] | 0, 15, -1560198380); b = ii(b, c, d, a, bin[i + 13] | 0, 21, 1309151649);
+    a = ii(a, b, c, d, bin[i + 4] | 0, 6, -145523070); d = ii(d, a, b, c, bin[i + 11] | 0, 10, -1120210379); c = ii(c, d, a, b, bin[i + 2] | 0, 15, 718787259); b = ii(b, c, d, a, bin[i + 9] | 0, 21, -343485551);
+    a = safeAdd(a, oa); b = safeAdd(b, ob); c = safeAdd(c, oc); d = safeAdd(d, od);
+  }
+  const hex = "0123456789abcdef";
+  const words = [a, b, c, d];
+  let out = "";
+  for (let i = 0; i < 16; i++) { const byte = (words[i >> 2] >> ((i % 4) * 8)) & 0xff; out += hex[(byte >> 4) & 0xf] + hex[byte & 0xf]; }
+  return out;
+}
+
+// ── MongoDB Atlas pause detection ────────────────────────────────────────────
+// GET an Atlas Admin API v2 resource using HTTP Digest auth (programmatic API
+// keys). fetch() doesn't do digest, so we drive the 401→challenge→retry by hand.
+async function atlasDigestGet(pub: string, priv: string, url: string): Promise<any> {
+  const accept = "application/vnd.atlas.2023-11-15+json";
+  const first = await fetch(url, { headers: { Accept: accept } });
+  if (first.status !== 401) {
+    if (first.ok) return await first.json();
+    throw new Error(`atlas pre-auth status ${first.status}`);
+  }
+  const wa = first.headers.get("WWW-Authenticate") || "";
+  const field = (k: string) => (wa.match(new RegExp(`${k}=\"?([^\",]+)\"?`)) || [])[1] || "";
+  const realm = field("realm"), nonce = field("nonce"), qop = field("qop") || "auth", opaque = field("opaque");
+  const u = new URL(url);
+  const path = u.pathname + u.search;
+  const md5 = md5hex;
+  const ha1 = md5(`${pub}:${realm}:${priv}`);
+  const ha2 = md5(`GET:${path}`);
+  const nc = "00000001";
+  const cnonce = md5(`${nonce}:${Date.now()}`).slice(0, 16);
+  const response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);
+  const auth = `Digest username="${pub}", realm="${realm}", nonce="${nonce}", uri="${path}", `
+    + `qop=${qop}, nc=${nc}, cnonce="${cnonce}", response="${response}", algorithm=MD5`
+    + (opaque ? `, opaque="${opaque}"` : "");
+  const second = await fetch(url, { headers: { Accept: accept, Authorization: auth } });
+  if (!second.ok) throw new Error(`atlas auth status ${second.status}`);
+  return await second.json();
+}
+
+// Returns true (paused), false (running), or null (unknown/creds missing/error).
+// null MUST be treated as "not paused" by callers so a probe failure never
+// suppresses a real page (fail-open).
+async function atlasClusterPaused(env: Env, which: "prod" | "staging"): Promise<boolean | null> {
+  const pfx = which === "prod" ? "ATLAS_PROD_" : "ATLAS_STAGING_";
+  const pub = (env as any)[`${pfx}PUBLIC_KEY`];
+  const priv = (env as any)[`${pfx}PRIVATE_KEY`];
+  const project = (env as any)[`${pfx}PROJECT_ID`];
+  const cluster = (env as any)[`${pfx}CLUSTER`];
+  if (!pub || !priv || !project || !cluster) return null;
+  try {
+    const d = await atlasDigestGet(pub, priv,
+      `https://cloud.mongodb.com/api/atlas/v2/groups/${project}/clusters/${cluster}`);
+    return d?.paused === true;
+  } catch (e) {
+    console.error(`[atlas] ${which} pause check failed: ${e}`);
+    return null;
+  }
+}
+
+// Poll both clusters, write KV flags the relay reads, and mute/unmute the
+// DB-symptom Datadog monitors. Called from the 5-min cron. Fail-open throughout.
+async function syncAtlasMaintenance(env: Env): Promise<void> {
+  if (!env.ALERT_STATE) return; // no KV → relay can't read a flag anyway
+  for (const which of ["prod", "staging"] as const) {
+    const paused = await atlasClusterPaused(env, which);
+    if (paused === null) continue; // unknown → leave prior flag; TTL backstops it
+    const key = `atlas-paused:${which}`;
+    if (paused) {
+      await env.ALERT_STATE.put(key, JSON.stringify({ paused: true, checkedAt: Date.now() }), { expirationTtl: 1800 });
+    } else {
+      await env.ALERT_STATE.delete(key); // unpause clears instantly
+    }
+    if (which === "prod") await syncDatadogMute(env, paused);
+  }
+}
+
+// Mute/unmute the DB-symptom Datadog monitors while prod is paused. Uses the
+// monitor mute API (the app key has monitor-write scope; the downtime API 403s
+// for this key). State-tracked in KV so we only toggle on transitions. The mute
+// carries an `end` backstop so a missed unmute (e.g. cron gap) self-heals.
+async function syncDatadogMute(env: Env, prodPaused: boolean): Promise<void> {
+  const monIds = (env.DD_DB_SYMPTOM_MONITOR_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (!env.DD_API_KEY || !env.DD_APP_KEY || !env.ALERT_STATE || monIds.length === 0) return;
+  const site = env.DD_SITE || "us5.datadoghq.com";
+  const H = { "DD-API-KEY": env.DD_API_KEY, "DD-APPLICATION-KEY": env.DD_APP_KEY };
+  const muted = await env.ALERT_STATE.get("atlas-dd-muted");
+  if (prodPaused) {
+    // Re-mute every tick (idempotent) so the `end` backstop is continuously
+    // refreshed — covers pauses longer than the backstop without an alert gap.
+    const end = Math.floor(Date.now() / 1000) + 6 * 3600;
+    let any = false;
+    for (const mid of monIds) {
+      try {
+        const res = await fetch(`https://api.${site}/api/v1/monitor/${mid}/mute?end=${end}`, { method: "POST", headers: H });
+        if (res.ok) any = true; else console.error(`[atlas] DD mute failed ${mid}: ${res.status}`);
+      } catch (e) { console.error(`[atlas] DD mute error ${mid}: ${e}`); }
+    }
+    if (any) await env.ALERT_STATE.put("atlas-dd-muted", "1", { expirationTtl: 1800 });
+  } else {
+    if (!muted) return;
+    for (const mid of monIds) {
+      await fetch(`https://api.${site}/api/v1/monitor/${mid}/unmute`, { method: "POST", headers: H }).catch(() => {});
+    }
+    await env.ALERT_STATE.delete("atlas-dd-muted");
+  }
+}
+
 async function alertPagerDuty(
   env: Env,
   summary: string,
@@ -1472,7 +1632,12 @@ async function disableCloudRunService(env: Env, serviceName: string): Promise<st
 
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
-    await checkUsage(env);
+    // Poll Atlas pause-state → KV flag + DD downtime FIRST, so a deliberate
+    // cluster pause suppresses DB-symptom alerts instead of false-paging. Run
+    // before checkUsage and independently wrapped: neither task may skip or
+    // break the other (a checkUsage throw must not skip the suppression flag).
+    try { await syncAtlasMaintenance(env); } catch (e) { console.error(`[atlas] sync failed: ${e}`); }
+    try { await checkUsage(env); } catch (e) { console.error(`[kill-switch] checkUsage failed: ${e}`); }
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -1518,6 +1683,19 @@ export default {
       const resolved = inc.state === "closed";
       const emoji = resolved ? ":white_check_mark:" : ":rotating_light:";
       const stateLabel = resolved ? "RESOLVED" : "FIRING";
+      // Maintenance gate: if this is a DB-symptom alert (5xx / ERROR logs) and
+      // prod Atlas is DELIBERATELY paused (KV flag set by the cron), suppress the
+      // PagerDuty page — a paused cluster makes DB routes 503 by design. Uptime
+      // and other alerts are NEVER suppressed (they'd signal a real outage).
+      // Fail-open: any error reading the flag → do NOT suppress.
+      const dbSymptom = /5xx|ERROR-severity|error logs/i.test(`${inc.policy_name ?? ""} ${inc.documentation?.subject ?? ""}`);
+      let maintenanceSuppress = false;
+      if (dbSymptom && !resolved && env.ALERT_STATE) {
+        try {
+          const flag = await env.ALERT_STATE.get("atlas-paused:prod");
+          if (flag && JSON.parse(flag).paused === true) maintenanceSuppress = true;
+        } catch { /* fail-open → page normally */ }
+      }
       // Escape Slack mrkdwn control chars (& < >) in alert-sourced text so a
       // crafted payload can't inject markup / fake links / @here mentions.
       const esc = (v: unknown) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 1000);
@@ -1531,7 +1709,8 @@ export default {
           linkSuffix = `\n<${u.toString()}|View incident>`;
         }
       } catch { /* no/invalid url → no link */ }
-      const text = `${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${linkSuffix}`;
+      const muteTag = maintenanceSuppress ? ":mute: *[Atlas paused — PD page suppressed]* " : "";
+      const text = `${muteTag}${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${linkSuffix}`;
       if (env.SLACK_WEBHOOK_URL) {
         const res = await fetch(env.SLACK_WEBHOOK_URL, {
           method: "POST",
@@ -1550,7 +1729,10 @@ export default {
       // in the webhook), strip GCP's "[ALERT - ...] " prefix, and dedup by the
       // GCP incident_id so open→trigger / closed→resolve collapse to one incident.
       let pdStatus: string | undefined;
-      if (wantPd) {
+      if (wantPd && maintenanceSuppress) {
+        pdStatus = "suppressed_atlas_paused";
+      }
+      if (wantPd && !maintenanceSuppress) {
         const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
         if (!routingKey) {
           console.error("[gcp-relay] pd=1 requested but PAGERDUTY_ROUTING_KEY unavailable");

@@ -29,6 +29,13 @@ secret_name = "PAGERDUTY_ROUTING_KEY"
 [vars]
 ENVIRONMENT = "production"
 
+# ── MongoDB Atlas pause detection ────────────────────────────────────────────
+# Datadog site + the DB-symptom monitor(s) to mute via downtime while prod Atlas
+# is deliberately paused (the CF 5xx monitor fires on the edge-visible 503s a
+# paused cluster produces). Atlas API keys + DD_API_KEY/DD_APP_KEY are secrets.
+DD_SITE = "us5.datadoghq.com"
+DD_DB_SYMPTOM_MONITOR_IDS = "20807649"
+
 # ── Kill Switch Service (https://kill-switch.net) ────────────────────────────
 # Centralized monitoring & alerting. The agent reports usage metrics to
 # kill-switch.net after each check, enabling multi-cloud dashboards & rules.
