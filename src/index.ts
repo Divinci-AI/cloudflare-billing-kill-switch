@@ -622,13 +622,30 @@ async function queryCloudRunUsage(env: Env): Promise<CloudRunServiceUsage[]> {
         "ALIGN_SUM"
       );
 
-      // Peak concurrent instances today (ALIGN_MAX — not SUM, which would
-      // sum every sampled data point into a meaningless cumulative number)
+      // Peak concurrent instances today — reported for visibility only (e.g.
+      // CLOUD_RUN_INSTANCE_THRESHOLD), NOT used for cost anymore. ALIGN_MAX
+      // over a whole day catches the brief double-instance moment during any
+      // deploy's traffic-migration cutover; treating that peak as if it ran
+      // continuously all day previously produced wildly inflated "$400/day"
+      // estimates from perfectly routine deploys (found 2026-07-18, incident
+      // Q33NXBLPOCZO90 — 5 staging deploys in 40min triggered a false ~$398
+      // total-daily-spend alert with real cumulative spend nowhere close).
       const peakInstances = await queryCloudMonitoringMetric(
         accessToken, projectId,
         `metric.type="run.googleapis.com/container/instance_count" AND resource.labels.service_name="${serviceName}"`,
         startOfDay, endTime,
         "ALIGN_MAX"
+      );
+
+      // Actual billed instance-time accrued so far today (seconds, cumulative
+      // DELTA metric — ALIGN_SUM gives the real total, immune to instantaneous
+      // spikes). This is what Cloud Run actually bills on, so no extrapolation
+      // artifact from a transient peak is possible.
+      const billableInstanceSeconds = await queryCloudMonitoringMetric(
+        accessToken, projectId,
+        `metric.type="run.googleapis.com/container/billable_instance_time" AND resource.labels.service_name="${serviceName}"`,
+        startOfDay, endTime,
+        "ALIGN_SUM"
       );
 
       // Estimate daily cost based on Cloud Run pricing (2nd gen, us-central1):
@@ -638,7 +655,7 @@ async function queryCloudRunUsage(env: Env): Promise<CloudRunServiceUsage[]> {
       const hoursElapsedToday = (now.getTime() - new Date(startOfDay).getTime()) / 3600000;
       const cpuCostPerInstanceHour = 2 * 0.0000240 * 3600;    // 2 vCPU × rate × 3600s
       const memCostPerInstanceHour = 2 * 0.0000025 * 3600;    // 2 GiB × rate × 3600s
-      const instanceCostSoFar = peakInstances * (cpuCostPerInstanceHour + memCostPerInstanceHour) * hoursElapsedToday;
+      const instanceCostSoFar = billableInstanceSeconds * (cpuCostPerInstanceHour + memCostPerInstanceHour) / 3600;
       const requestCost = requestCount * 0.0000004;
 
       // Only extrapolate to full day if we have at least 2 hours of data.
