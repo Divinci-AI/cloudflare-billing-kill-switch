@@ -37,7 +37,11 @@ interface Env {
   // Alert destinations (at least one recommended)
   PAGERDUTY_ROUTING_KEY?: string;  // Events API v2 integration key
   DISCORD_WEBHOOK_URL?: string;    // Discord channel webhook URL
-  SLACK_WEBHOOK_URL?: string;      // Slack incoming webhook URL
+  SLACK_WEBHOOK_URL?: string;      // Slack incoming webhook URL (kill-switch / default)
+  // GCP Monitoring /gcp-alert + /gcp-page relay. Prefer this over SLACK_WEBHOOK_URL
+  // so prod GCP pages can land in #alerts without moving billing kill-switch posts
+  // that may still target #divinci-app.
+  GCP_SLACK_WEBHOOK_URL?: string;
   CUSTOM_WEBHOOK_URL?: string;     // Any HTTP endpoint that accepts POST JSON
 
   // Thresholds (configurable via wrangler.toml [vars])
@@ -1728,8 +1732,11 @@ export default {
       } catch { /* no/invalid url → no link */ }
       const muteTag = maintenanceSuppress ? ":mute: *[Atlas paused — PD page suppressed]* " : "";
       const text = `${muteTag}${emoji} *GCP Alert [${stateLabel}]* — ${title}\n${summary}${linkSuffix}`;
-      if (env.SLACK_WEBHOOK_URL) {
-        const res = await fetch(env.SLACK_WEBHOOK_URL, {
+      // Prefer GCP_SLACK_WEBHOOK_URL (#alerts) so GCP pages are not stuck on the
+      // kill-switch webhook (#divinci-app). Fall back for backwards compatibility.
+      const slackWebhook = env.GCP_SLACK_WEBHOOK_URL || env.SLACK_WEBHOOK_URL;
+      if (slackWebhook) {
+        const res = await fetch(slackWebhook, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }),
@@ -2105,6 +2112,7 @@ export default {
         pagerduty: !!env.PAGERDUTY_ROUTING_KEY,
         discord: !!env.DISCORD_WEBHOOK_URL,
         slack: !!env.SLACK_WEBHOOK_URL,
+        gcpSlack: !!(env.GCP_SLACK_WEBHOOK_URL || env.SLACK_WEBHOOK_URL),
         customWebhook: !!env.CUSTOM_WEBHOOK_URL,
       },
       sdkDocs: {

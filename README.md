@@ -81,8 +81,14 @@ wrangler secret put PAGERDUTY_ROUTING_KEY
 wrangler secret put DISCORD_WEBHOOK_URL
 # → Get this from: Discord → Channel Settings → Integrations → Webhooks → New Webhook
 
-# Slack
+# Slack (billing kill-switch default; may target #divinci-app)
 wrangler secret put SLACK_WEBHOOK_URL
+
+# Slack for GCP Monitoring relay (/gcp-alert + /gcp-page) — prefer #alerts
+# so prod pages are not stuck on the kill-switch webhook channel.
+wrangler secret put GCP_SLACK_WEBHOOK_URL
+# → Slack → #alerts → Integrations → Incoming Webhooks → New Webhook
+# Then redeploy (or wait for next deploy) so the Worker picks up the secret.
 
 # Any custom HTTP endpoint
 wrangler secret put CUSTOM_WEBHOOK_URL

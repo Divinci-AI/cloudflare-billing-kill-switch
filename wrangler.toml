@@ -3,13 +3,24 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Check usage every 5 minutes. Adjust as needed:
+# Check usage every 15 minutes. Adjust as needed:
 #   "*/5 * * * *"   = every 5 minutes (aggressive)
+#   "*/15 * * * *"  = every 15 minutes (current — relaxed from */5 on 2026-07-23)
 #   "0 * * * *"     = every hour
 #   "0 */6 * * *"   = every 6 hours (default)
 #   "0 0 * * *"     = once daily
+#
+# Relaxed 2026-07-23: each tick fires ~7 Cloudflare GraphQL Analytics queries
+# (Workers, DO, AI Inference, AI Gateway, Vectorize, R2, D1/Queue usage). At
+# */5 that's ~2000 GraphQL calls/day against what appears to be an
+# account-wide (not per-token) analytics rate limit — during the WAF incident
+# this same day, a completely different API token got "rate limiter budget
+# depleted" on firewallEventsAdaptive queries for 10+ minutes straight while
+# idle otherwise. */15 cuts this worker's GraphQL volume ~3x (~670/day) while
+# still catching a genuine cost runaway within 15 min — well inside the
+# 10x DISCONNECT_THRESHOLD_MULTIPLIER safety margin and the 6h alert cooldown.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/15 * * * *"]
 
 # Alert de-dup state (edge-triggered webhook alerts). Optional: if removed,
 # de-dup becomes a no-op and chatty channels repeat every check.
@@ -212,5 +223,7 @@ PROTECTED_WORKERS = "cloudflare-billing-kill-switch,divinci-agent-stage,divinci-
 #   PAGERDUTY_ROUTING_KEY   — PagerDuty Events API v2 integration key
 #                             (pages on-call until acknowledged)
 #   DISCORD_WEBHOOK_URL     — Discord channel webhook URL
-#   SLACK_WEBHOOK_URL       — Slack incoming webhook URL
+#   SLACK_WEBHOOK_URL       — Slack incoming webhook (kill-switch default)
+#   GCP_SLACK_WEBHOOK_URL   — Slack incoming webhook for /gcp-alert + /gcp-page
+#                             (prefer #alerts; falls back to SLACK_WEBHOOK_URL)
 #   CUSTOM_WEBHOOK_URL      — Any HTTP endpoint that accepts POST JSON
