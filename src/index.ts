@@ -1187,10 +1187,8 @@ function costAlertDedupKey(dedupSuffix = ""): string {
   return `cf-billing${dedupSuffix ? `-${dedupSuffix}` : ""}`;
 }
 
-/** Resolve the open cost incident once usage is back within thresholds. */
-async function resolvePagerDutyCostAlert(env: Env): Promise<void> {
-  const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
-  if (!routingKey) return;
+/** Send a single Events API v2 resolve. Returns true if PagerDuty accepted it. */
+async function pdResolve(routingKey: string, dedupKey: string): Promise<boolean> {
   try {
     const res = await fetch("https://events.pagerduty.com/v2/enqueue", {
       method: "POST",
@@ -1198,17 +1196,61 @@ async function resolvePagerDutyCostAlert(env: Env): Promise<void> {
       body: JSON.stringify({
         routing_key: routingKey,
         event_action: "resolve",
-        dedup_key: costAlertDedupKey(),
+        dedup_key: dedupKey,
       }),
     });
     // 202 = accepted. A resolve for a key with no open incident is a no-op,
-    // so this is safe to send on every clean check.
+    // so this is safe to send unconditionally.
     if (!res.ok) {
-      console.error(`[kill-switch] PagerDuty resolve error: ${res.status} ${await res.text()}`);
+      console.error(`[kill-switch] PagerDuty resolve error (${dedupKey}): ${res.status} ${await res.text()}`);
+      return false;
     }
+    return true;
   } catch (err) {
-    console.error(`[kill-switch] PagerDuty resolve failed: ${err}`);
+    console.error(`[kill-switch] PagerDuty resolve failed (${dedupKey}): ${err}`);
+    return false;
   }
+}
+
+/**
+ * One-time cleanup of incidents opened under the OLD date-based dedup key.
+ *
+ * Before the stable-key fix, the key embedded the UTC date, so a chronically
+ * tripped threshold opened a fresh incident every day and nothing ever resolved
+ * one. That backlog cannot self-heal: each incident is keyed to a date this
+ * worker will never generate again, so the ordinary resolve above can never
+ * reach it — they would otherwise sit open until closed by hand.
+ *
+ * Resolving a dedup_key with no open incident is a no-op, so replaying the last
+ * LEGACY_DEDUP_DAYS days is safe. Gated behind a KV flag so it runs once rather
+ * than every 15 minutes; if ALERT_STATE is unbound we skip entirely rather than
+ * replay ~45 requests per check forever.
+ */
+const LEGACY_DEDUP_DAYS = 45;
+const LEGACY_CLEANUP_KEY = "pd-legacy-dedup-cleanup-done";
+
+async function resolveLegacyDatedCostAlerts(env: Env, routingKey: string): Promise<void> {
+  if (!env.ALERT_STATE) return;
+  if (await env.ALERT_STATE.get(LEGACY_CLEANUP_KEY)) return;
+
+  const today = new Date();
+  let resolved = 0;
+  for (let i = 0; i < LEGACY_DEDUP_DAYS; i++) {
+    const d = new Date(today.getTime() - i * 86400000).toISOString().split("T")[0];
+    if (await pdResolve(routingKey, `cf-billing-${d}`)) resolved++;
+  }
+  await env.ALERT_STATE.put(LEGACY_CLEANUP_KEY, new Date().toISOString());
+  console.error(
+    `[kill-switch] Legacy PagerDuty cleanup: replayed resolve for ${LEGACY_DEDUP_DAYS} dated keys (${resolved} accepted). Runs once.`
+  );
+}
+
+/** Resolve the open cost incident once usage is back within thresholds. */
+async function resolvePagerDutyCostAlert(env: Env): Promise<void> {
+  const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
+  if (!routingKey) return;
+  await pdResolve(routingKey, costAlertDedupKey());
+  await resolveLegacyDatedCostAlerts(env, routingKey);
 }
 
 async function alertPagerDuty(
