@@ -36,6 +36,13 @@ interface Env {
 
   // Alert destinations (at least one recommended)
   PAGERDUTY_ROUTING_KEY?: string;  // Events API v2 integration key
+  // "always" (default) — page on any threshold breach, as before.
+  // "actions" — page only when the switch actually acted (disconnected a
+  //   route, set maxInstances=0, deleted a worker). Breach-only alerts still
+  //   go to Discord/Slack/custom webhooks. Use this when a threshold sits
+  //   close enough to baseline that it trips routinely: a daily page nobody
+  //   can act on is how a pager stops being read.
+  PAGERDUTY_PAGE_ON?: string;
   DISCORD_WEBHOOK_URL?: string;    // Discord channel webhook URL
   SLACK_WEBHOOK_URL?: string;      // Slack incoming webhook URL (kill-switch / default)
   // GCP Monitoring /gcp-alert + /gcp-page relay. Prefer this over SLACK_WEBHOOK_URL
@@ -971,14 +978,19 @@ async function sendAlerts(
   severity: "critical" | "error" | "warning" | "info",
   details: Record<string, unknown>,
   dedupSuffix = "",
-  suppressWebhooks = false
+  suppressWebhooks = false,
+  skipPagerDuty = false
 ): Promise<void> {
   const promises: Promise<void>[] = [];
 
-  // PagerDuty always fires — it collapses repeats into a single incident via
-  // dedup_key, so it's safe to re-trigger every check (keeps the incident live).
-  if (env.PAGERDUTY_ROUTING_KEY) {
+  // PagerDuty fires by default — it collapses repeats into a single incident
+  // via dedup_key, so it's safe to re-trigger every check (keeps the incident
+  // live). skipPagerDuty lets a caller route a non-actionable alert to the
+  // webhook channels only; see PAGERDUTY_PAGE_ON.
+  if (env.PAGERDUTY_ROUTING_KEY && !skipPagerDuty) {
     promises.push(alertPagerDuty(env, summary, severity, details, dedupSuffix));
+  } else if (skipPagerDuty) {
+    console.error("[kill-switch] PagerDuty skipped: PAGERDUTY_PAGE_ON=actions and the switch took no action.");
   }
   if (suppressWebhooks) {
     console.error("[kill-switch] Webhook channels suppressed (within alert cooldown); PagerDuty still notified.");
@@ -1156,6 +1168,49 @@ async function syncDatadogMute(env: Env, prodPaused: boolean): Promise<void> {
   }
 }
 
+/**
+ * PagerDuty dedup key for the cost alert.
+ *
+ * This used to embed the UTC date (`cf-billing-2026-07-30`), which meant a
+ * chronically-tripped threshold opened a BRAND NEW incident every single UTC
+ * day — forever. Combined with the fact that nothing ever sent `resolve`, that
+ * produced an unbounded pile of open incidents: 12 of them over 30 days here,
+ * every one acknowledged and never resolved, and nothing else paging in that
+ * window. A pager that only ever cries wolf stops being read, which is the
+ * failure this whole worker exists to prevent for money.
+ *
+ * The key is now stable, so PagerDuty keeps ONE incident open for as long as
+ * spend is over threshold and closes it when spend returns to normal — the
+ * incident reflects current state rather than accumulating one per day.
+ */
+function costAlertDedupKey(dedupSuffix = ""): string {
+  return `cf-billing${dedupSuffix ? `-${dedupSuffix}` : ""}`;
+}
+
+/** Resolve the open cost incident once usage is back within thresholds. */
+async function resolvePagerDutyCostAlert(env: Env): Promise<void> {
+  const routingKey = await resolveSecret(env.PAGERDUTY_ROUTING_KEY);
+  if (!routingKey) return;
+  try {
+    const res = await fetch("https://events.pagerduty.com/v2/enqueue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routing_key: routingKey,
+        event_action: "resolve",
+        dedup_key: costAlertDedupKey(),
+      }),
+    });
+    // 202 = accepted. A resolve for a key with no open incident is a no-op,
+    // so this is safe to send on every clean check.
+    if (!res.ok) {
+      console.error(`[kill-switch] PagerDuty resolve error: ${res.status} ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error(`[kill-switch] PagerDuty resolve failed: ${err}`);
+  }
+}
+
 async function alertPagerDuty(
   env: Env,
   summary: string,
@@ -1163,7 +1218,7 @@ async function alertPagerDuty(
   details: Record<string, unknown>,
   dedupSuffix = ""
 ): Promise<void> {
-  const dedup = `cf-billing-${new Date().toISOString().split("T")[0]}${dedupSuffix ? `-${dedupSuffix}` : ""}`;
+  const dedup = costAlertDedupKey(dedupSuffix);
 
   // PAGERDUTY_ROUTING_KEY is a Secrets Store binding (object with async .get()),
   // NOT a plain string — serializing it directly sends a malformed routing_key
@@ -1583,10 +1638,25 @@ async function checkUsage(env: Env): Promise<CheckResult> {
     // doesn't repeat ~288×/day. PagerDuty still fires (self-dedups).
     const suppressWebhooks = await shouldSuppressWebhookAlerts(env, violations);
 
+    // A threshold breach and an actual kill are not the same event, and they
+    // were being reported identically. `actions` is non-empty only when the
+    // switch DID something (disconnected a route, set maxInstances=0, deleted a
+    // worker) — that is the thing worth waking someone for. A breach the switch
+    // deliberately did NOT act on (below DISCONNECT_THRESHOLD_MULTIPLIER) is a
+    // spend report: real, worth reading, not worth a 3am page.
+    const tookAction = actions.length > 0;
+    const severity = tookAction ? "critical" : "warning";
+
+    // PAGERDUTY_PAGE_ON=actions routes breach-only alerts to the webhook
+    // channels and keeps PagerDuty for kills. Default "always" preserves the
+    // previous behaviour for existing deployments.
+    const pageOn = (env.PAGERDUTY_PAGE_ON || "always").toLowerCase();
+    const skipPagerDuty = pageOn === "actions" && !tookAction;
+
     await sendAlerts(
       env,
       `Cost alert [${[...providers].join("+")}]: ${violations.length} service(s) exceeded thresholds`,
-      "critical",
+      severity,
       {
         violations,
         actionsTaken: actions,
@@ -1602,10 +1672,15 @@ async function checkUsage(env: Env): Promise<CheckResult> {
         checkedAt: new Date().toISOString(),
       },
       "",
-      suppressWebhooks
+      suppressWebhooks,
+      skipPagerDuty
     );
   } else {
     console.error("[kill-switch] All usage within thresholds.");
+    // Close the incident instead of leaving it open forever. Nothing ever sent
+    // `resolve` on this path, so every incident this worker opened stayed open
+    // until a human closed it by hand.
+    await resolvePagerDutyCostAlert(env);
   }
 
   const result: CheckResult = { violations, actions, doUsage, workerUsage, r2Usage, d1Usage, queueUsage, cloudRunUsage, aiUsage, aiGatewayUsage, vectorizeUsage };

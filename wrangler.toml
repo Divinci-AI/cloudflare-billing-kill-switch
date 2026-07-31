@@ -144,6 +144,19 @@ VECTORIZE_DIMENSIONS_THRESHOLD = "500000000"
 # also has its own CLOUD_RUN_MONTHLY_COST_THRESHOLD = $8000/mo ≈ $266/day.)
 TOTAL_DAILY_SPEND_THRESHOLD = "300"
 
+# ── PagerDuty: page on kills, not on breaches ───────────────────────────────
+# "actions" pages ONLY when the switch actually did something (disconnected a
+# route, set maxInstances=0, deleted a worker). A threshold breach it chose not
+# to act on — anything below DISCONNECT_THRESHOLD_MULTIPLIER — still goes to
+# Slack/Discord, just not to the pager.
+#
+# Set 2026-07-31. Before this, EVERY open PagerDuty incident was this alert:
+# 12 of 12 over 30 days, one per UTC day at High urgency, each acknowledged and
+# never resolved, and nothing else paged in that window. A pager carrying only
+# a daily spend report is a pager nobody reads — the exact failure mode this
+# worker exists to prevent for money. Kills still page. ("always" = old behaviour.)
+PAGERDUTY_PAGE_ON = "actions"
+
 # ── Alert de-dup ─────────────────────────────────────────────────────────────
 # Suppress repeat Discord/Slack/custom alerts for the SAME violation set within
 # this many hours. The cron runs every 5 min and daily-cumulative thresholds

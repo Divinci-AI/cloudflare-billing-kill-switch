@@ -94,6 +94,26 @@ wrangler secret put GCP_SLACK_WEBHOOK_URL
 wrangler secret put CUSTOM_WEBHOOK_URL
 ```
 
+#### Choosing what pages you: `PAGERDUTY_PAGE_ON`
+
+A threshold breach and an actual kill are different events. By default both page.
+
+| Value | Behaviour |
+|---|---|
+| `always` (default) | Page on any threshold breach. |
+| `actions` | Page only when the switch **acted** — disconnected a route, set `maxInstances=0`, deleted a worker. Breach-only alerts still go to Discord/Slack/custom webhooks. |
+
+Reach for `actions` when a threshold sits close enough to baseline that it trips
+routinely. A breach below `DISCONNECT_THRESHOLD_MULTIPLIER` is a spend report,
+not an incident — nobody can act on it at 3am, and a pager that only ever
+carries unactionable alerts stops being read. That is the same failure this
+worker exists to prevent for money, applied to attention.
+
+The cost incident also uses a **stable** dedup key and now **resolves itself**
+once usage returns within thresholds. Previously the key embedded the UTC date,
+so a chronically-tripped threshold opened a fresh incident every day, and
+nothing ever sent `resolve` — they accumulated until closed by hand.
+
 ### 4. Test it
 
 ```bash
