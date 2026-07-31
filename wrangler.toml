@@ -47,6 +47,16 @@ ENVIRONMENT = "production"
 DD_SITE = "us5.datadoghq.com"
 DD_DB_SYMPTOM_MONITOR_IDS = "20807649"
 
+# Datadog status-page ids. Declared here purely so `wrangler deploy` PRESERVES
+# them: both were attached out-of-band and `deploy` replaces plain-text vars
+# wholesale from this file, so an undeclared deploy silently drops them — the
+# same trap documented above for PAGERDUTY_ROUTING_KEY, still live for these two
+# (caught 2026-07-31 by diffing deployed bindings against this file before a
+# deploy). Nothing in src/ reads them today; kept rather than dropped because
+# they were set deliberately and losing config by accident is not a decision.
+DD_STATUS_PAGE_ID = "890d7118-a4d5-45d1-8f74-88858a16fa4b"
+DD_STATUS_COMPONENT_PLATFORM = "0987f6a7-11a9-44e8-a591-ab410bc0b5b2"
+
 # ── Kill Switch Service (https://kill-switch.net) ────────────────────────────
 # Centralized monitoring & alerting. The agent reports usage metrics to
 # kill-switch.net after each check, enabling multi-cloud dashboards & rules.
