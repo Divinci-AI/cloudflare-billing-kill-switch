@@ -129,7 +129,18 @@ SDK_DOCS_ERROR_THRESHOLD = "100"
 # ~15x spike well before it compounds, without firing on embedding-heavy days.
 # NOTE: alert-only — there is no CF API to throttle Workers AI per-model;
 # mitigate in-app by dropping the offending model from the fallback chain.
-AI_NEURONS_THRESHOLD = "500000"
+#
+# ⏳ TEMPORARILY RAISED 500,000 → 20,000,000 on 2026-08-15. RESTORE 2026-09-30.
+# The Workers Launchpad credits expire ~2026-09-30 and we are running the
+# www-rag crawl/embed pipeline on Cloudflare until then (see the server repo,
+# notebooks/CLOUDFLARE_PIPELINE_GOAL.md). Embedding the corpus is ~5.45M
+# Neurons and generation bursts push a few million more per day, so at 500k
+# this fires EVERY day of the campaign — which is how the daily cost alert
+# became unreadable before 2026-07-31, from the other direction.
+# 20M Neurons ≈ $220/day. That is still ~5× the 2026-06-15 incident (3.67M),
+# so a genuine model runaway is still caught; it just no longer fires on
+# planned work. This is a VISIBILITY trade only — the binding takes no action.
+AI_NEURONS_THRESHOLD = "20000000"
 
 # ── AI Gateway (external-provider LLM cost) ──────────────────────────────────
 # Daily upstream-provider cost ($) routed through AI Gateway before alerting.
@@ -152,7 +163,15 @@ VECTORIZE_DIMENSIONS_THRESHOLD = "500000000"
 # dashboard number and sat BELOW baseline, so it fired every single check. $300
 # is ~2.2× the real baseline — catches a genuine runaway without nagging. (GCP
 # also has its own CLOUD_RUN_MONTHLY_COST_THRESHOLD = $8000/mo ≈ $266/day.)
-TOTAL_DAILY_SPEND_THRESHOLD = "300"
+#
+# ⏳ TEMPORARILY RAISED 300 → 600 on 2026-08-15. RESTORE 2026-09-30.
+# Same Launchpad-credit campaign as AI_NEURONS_THRESHOLD above. Note the
+# campaign's two biggest line items — Browser Run and Containers — are NOT in
+# this sum (it covers DO + Workers + R2 + Workers AI Neurons + Cloud Run), so
+# what actually pushes this up is only the pipeline's Workers AI usage, roughly
+# $200/day at peak on top of the ~$130-140 baseline. 600 is ~4.3× baseline and
+# still catches a genuine runaway. Alert-only: nothing acts on this threshold.
+TOTAL_DAILY_SPEND_THRESHOLD = "600"
 
 # ── PagerDuty: page on kills, not on breaches ───────────────────────────────
 # "actions" pages ONLY when the switch actually did something (disconnected a
