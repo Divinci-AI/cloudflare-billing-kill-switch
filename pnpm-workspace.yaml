@@ -1,0 +1,11 @@
+# Present so `pnpm install` can approve the build scripts the test runner needs.
+# pnpm 10+ reads build approvals ONLY from a workspace file — `pnpm.onlyBuiltDependencies`
+# in package.json and `only-built-dependencies[]` in .npmrc are both silently ignored —
+# and it EXITS NON-ZERO when it withholds one, which breaks `&&` chains and makes a
+# skipped install look like a cosmetic notice.
+packages:
+  - "."
+allowBuilds:
+  esbuild: true    # vitest's bundler
+  sharp: false     # wrangler transitive; unused here
+  workerd: false   # only needed for `wrangler dev`

@@ -1852,15 +1852,35 @@ export default {
       // Prefer GCP_SLACK_WEBHOOK_URL (#alerts) so GCP pages are not stuck on the
       // kill-switch webhook (#divinci-app). Fall back for backwards compatibility.
       const slackWebhook = env.GCP_SLACK_WEBHOOK_URL || env.SLACK_WEBHOOK_URL;
+      // ⛔ Slack is the LOWER-severity leg and must NEVER be able to suppress a
+      // page. This block used to `return 502` on a failed Slack post, before the
+      // PagerDuty enqueue below ever ran — so when the Slack webhook died on
+      // 2026-08-16T18:41Z, every one of the twelve paging policies routed here
+      // went silent for four days while GCP dutifully logged "Webhook failed
+      // with 502". An outage in the observability layer became an outage of the
+      // pager. Record the outcome, keep going, and let the authoritative leg
+      // decide the response status.
+      let slackStatus: string | undefined;
       if (slackWebhook) {
-        const res = await fetch(slackWebhook, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }),
-        });
-        if (!res.ok) {
-          console.error(`[gcp-relay] Slack post failed: ${res.status}`);
-          return Response.json({ error: "slack post failed" }, { status: 502 });
+        try {
+          const res = await fetch(slackWebhook, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text, blocks: [{ type: "section", text: { type: "mrkdwn", text } }] }),
+          });
+          if (!res.ok) {
+            // Slack returns the reason in the body ("no_service" for a revoked
+            // webhook, "invalid_token"). The status code alone is not
+            // actionable, and this is the line someone reads at 3am.
+            const body = await res.text().catch(() => "");
+            console.error(`[gcp-relay] Slack post failed: ${res.status} ${body.slice(0, 200)}`);
+            slackStatus = `error_${res.status}`;
+          } else {
+            slackStatus = "posted";
+          }
+        } catch (e) {
+          console.error(`[gcp-relay] Slack post threw: ${e}`);
+          slackStatus = "error_threw";
         }
       }
       // Optional PagerDuty paging. CRIT-tier GCP policies point here with ?pd=1
@@ -1919,7 +1939,23 @@ export default {
           }
         }
       }
-      return Response.json({ status: "relayed", state: resolved ? "resolved" : "firing", pd: pdStatus });
+      // Which leg is authoritative depends on the endpoint: /gcp-page exists to
+      // page, /gcp-alert exists to post to Slack. Report failure to GCP (so it
+      // retries and writes a notification_channel_events ERROR) only when THAT
+      // leg failed — never because the other one did.
+      const slackFailed = slackStatus !== undefined && slackStatus !== "posted";
+      const pdFailed =
+        wantPd && (pdStatus === undefined || pdStatus === "no_routing_key" || pdStatus.startsWith("error_"));
+      const authoritativeFailed = wantPd ? pdFailed : slackFailed;
+      return Response.json(
+        {
+          status: slackFailed || pdFailed ? "relayed_degraded" : "relayed",
+          state: resolved ? "resolved" : "firing",
+          pd: pdStatus,
+          slack: slackStatus,
+        },
+        { status: authoritativeFailed ? 502 : 200 },
+      );
     }
 
     // Auth: require ADMIN_SECRET for all non-health endpoints

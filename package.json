@@ -21,11 +21,13 @@
     "deploy": "wrangler deploy",
     "check": "curl -s https://cloudflare-billing-kill-switch.<your-subdomain>.workers.dev/check | jq",
     "usage": "curl -s https://cloudflare-billing-kill-switch.<your-subdomain>.workers.dev/usage | jq",
-    "test-alert": "curl -s https://cloudflare-billing-kill-switch.<your-subdomain>.workers.dev/test-alert | jq"
+    "test-alert": "curl -s https://cloudflare-billing-kill-switch.<your-subdomain>.workers.dev/test-alert | jq",
+    "test": "vitest run"
   },
   "devDependencies": {
     "wrangler": "^4.0.0",
     "typescript": "^5.0.0",
-    "@cloudflare/workers-types": "^4.0.0"
+    "@cloudflare/workers-types": "^4.0.0",
+    "vitest": "^3.2.4"
   }
 }
