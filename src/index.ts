@@ -972,6 +972,29 @@ async function shouldSuppressWebhookAlerts(env: Env, violations: string[]): Prom
   }
 }
 
+/**
+ * Which Slack webhook the kill-switch's OWN alerts (cost thresholds, and the
+ * alert fired when the switch ACTS) should post to.
+ *
+ * gap: kill-switch-own-alerts-use-the-dead-webhook
+ *
+ * Prefers SLACK_WEBHOOK_URL — this path's own channel — and falls back to the
+ * GCP relay's webhook so these alerts always have SOMEWHERE to land. Until
+ * 2026-08-21 there was no fallback, so when the #divinci-app webhook died on
+ * 2026-08-16 the switch's own alerts went nowhere, including the one it emits
+ * after applying maxInstances=0 to production. Fixing the GCP relay did not fix
+ * this, because only the relay handler consulted GCP_SLACK_WEBHOOK_URL.
+ *
+ * PagerDuty is unaffected either way: in sendAlerts the PagerDuty block runs
+ * BEFORE the Slack block, so a Slack failure cannot suppress a page. That
+ * ordering is load-bearing — the inverse of it is what took the pager down for
+ * four days in the relay handler, and it must not be "tidied" into one shared
+ * helper that posts Slack first.
+ */
+export function killSwitchSlackWebhook(env: Env): string | undefined {
+  return env.SLACK_WEBHOOK_URL || env.GCP_SLACK_WEBHOOK_URL;
+}
+
 async function sendAlerts(
   env: Env,
   summary: string,
@@ -998,7 +1021,7 @@ async function sendAlerts(
     if (env.DISCORD_WEBHOOK_URL) {
       promises.push(alertDiscord(env, summary, severity, details));
     }
-    if (env.SLACK_WEBHOOK_URL) {
+    if (killSwitchSlackWebhook(env)) {
       promises.push(alertSlack(env, summary, severity, details));
     }
     if (env.CUSTOM_WEBHOOK_URL) {
@@ -1007,7 +1030,7 @@ async function sendAlerts(
   }
 
   if (promises.length === 0 && !suppressWebhooks) {
-    console.error("[kill-switch] WARNING: No alert destinations configured. Set at least one of: PAGERDUTY_ROUTING_KEY, DISCORD_WEBHOOK_URL, SLACK_WEBHOOK_URL, CUSTOM_WEBHOOK_URL");
+    console.error("[kill-switch] WARNING: No alert destinations configured. Set at least one of: PAGERDUTY_ROUTING_KEY, DISCORD_WEBHOOK_URL, SLACK_WEBHOOK_URL, GCP_SLACK_WEBHOOK_URL, CUSTOM_WEBHOOK_URL");
   }
 
   await Promise.allSettled(promises);
@@ -1336,7 +1359,7 @@ async function alertSlack(
 ): Promise<void> {
   const emojiMap = { critical: ":rotating_light:", error: ":warning:", warning: ":large_yellow_circle:", info: ":information_source:" };
 
-  const res = await fetch(env.SLACK_WEBHOOK_URL!, {
+  const res = await fetch(killSwitchSlackWebhook(env)!, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -2264,7 +2287,10 @@ export default {
       alertDestinations: {
         pagerduty: !!env.PAGERDUTY_ROUTING_KEY,
         discord: !!env.DISCORD_WEBHOOK_URL,
-        slack: !!env.SLACK_WEBHOOK_URL,
+        // Resolved, not raw: with SLACK_WEBHOOK_URL removed this field would
+        // report "no Slack" while the switch's alerts reach Slack fine via the
+        // fallback — a status endpoint lying about its own destinations.
+        slack: !!killSwitchSlackWebhook(env),
         gcpSlack: !!(env.GCP_SLACK_WEBHOOK_URL || env.SLACK_WEBHOOK_URL),
         customWebhook: !!env.CUSTOM_WEBHOOK_URL,
       },
